@@ -35,6 +35,29 @@ VectorCore ePDG
 - **Reauthentication** — Configurable policy: preserve existing S2b session or detach and re-attach
 - **3GPP compliant** — Implements TS 23.402, TS 24.302, TS 29.273, TS 29.274, TS 33.402
 
+## Supported Algorithms
+
+### IKE SA
+
+| Transform | Supported |
+|---|---|
+| Encryption | AES-CBC-128, AES-CBC-256 |
+| Integrity | HMAC-SHA1-96, HMAC-SHA2-256-128, HMAC-SHA2-512-256 |
+| PRF | PRF-HMAC-SHA1, PRF-HMAC-SHA256, PRF-HMAC-SHA512 |
+| Diffie-Hellman | Group 14 (2048-bit MODP), Group 15 (3072-bit MODP) |
+
+Proposals are matched in preference order. Preferred: AES-CBC-256 + HMAC-SHA2-256-128 + PRF-SHA-256 + DH14.
+
+### ESP (CHILD SA)
+
+| Transform | Supported |
+|---|---|
+| Encryption | AES-CBC-128, AES-CBC-256 |
+| Integrity | HMAC-SHA1-96, HMAC-SHA2-256-128, HMAC-SHA2-512-256 |
+| PFS | Group 14 or Group 15 (preferred); no-PFS accepted as fallback |
+
+Preferred: AES-CBC-256 + HMAC-SHA2-256-128 + PFS DH14.
+
 ## Requirements
 
 ### Runtime
