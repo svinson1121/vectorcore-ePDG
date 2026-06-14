@@ -1,0 +1,91 @@
+epdg:
+  name: epdg2.epc.mnc435.mcc311.3gppnetwork.org
+  realm: epc.mnc435.mcc311.3gppnetwork.org
+  mcc: "311"
+  mnc: "435"
+  mnc_length: 3
+
+logging:
+  level: info
+  file: /var/log/vectorcore/epdg/epdg.log
+
+ikev2:
+  listen_addr: 0.0.0.0
+  # listen_ifname: eth0   # optional: bind to a specific interface
+  cert_file: config/certs/epdgCert.pem
+  key_file:  config/certs/epdgKey.pem
+  ca_file:   config/certs/ca.pem
+  dpd_delay: 30     # seconds idle before sending a DPD probe
+  dpd_timeout: 120  # seconds to wait for DPD response before tearing down
+
+swm:
+  # peer_addr/peer_port is the immediate Diameter peer.
+  # For direct SWm, set this to the AAA address.
+  # For DRA relay, set this to the DRA listener address and use destination_realm
+  # plus optional destination_host for the final AAA routing target.
+  local_addr: 10.90.250.57
+  peer_addr: 10.90.250.35
+  peer_port: 3868
+  proto: sctp # tcp | sctp
+  origin_host: epdg2.epc.mnc435.mcc311.3gppnetwork.org
+  origin_realm: epc.mnc435.mcc311.3gppnetwork.org
+  # Leave destination_host empty or omit it when the DRA should route by realm.
+  # Set destination_host to the final AAA host for direct host routing.
+  # destination_host: aaa01.epc.mnc435.mcc311.3gppnetwork.org
+  destination_realm: epc.mnc435.mcc311.3gppnetwork.org
+  watchdog_interval_seconds: 30
+  watchdog_timeout_seconds: 10
+
+gtp:
+  local_gtpc: 10.90.250.57
+  local_addr: 10.90.250.57
+  local_port: 2152
+  pgw_gtpc: 10.90.250.92
+  pgw_gtpu: 10.90.250.92
+  recovery: 0
+  tun_name: vc-gtpu0
+  mtu: 1400
+  validate_outer_peer: true
+  strict_peer_check: true
+  cleanup_stale_routes_on_start: true
+  max_sequence: 8388607  # Cisco StarOS qvpc-si: rejects bit-23 sequences (StarOS defect).
+  uplink_capture_mode: nfqueue
+  nfqueue_queue_num: 4200
+  nfqueue_install_rules: true
+  nfqueue_firewall_backend: iptables
+  nfqueue_chain_name: VECTORCORE-EPDG-UPLINK
+  nfqueue_ingress_ifname: ""
+  nfqueue_queue_bypass: false
+  nfqueue_fail_closed: true
+  nfqueue_cleanup_stale_rules_on_start: true
+
+dedicated_bearers:
+  enabled: true
+  tft_uplink_selection: true
+
+apn:
+  default: ims
+
+pco:
+  enabled: true
+  request_dns: true
+  request_pcscf: true
+  request_mtu: false
+  include_apco: true
+  strict_decode: false
+
+datapath:
+  enable_ip_forwarding_check: true
+  install_routes: false
+  require_paa_ipsec_alignment: true
+  uplink_policy_routing_enabled: false
+  uplink_table_name: vectorcore-epdg-gtp
+  uplink_priority_base: 10000
+
+reauth:
+  mode: preserve_existing_s2b
+  allow_fallback_new_attach: false
+  on_failure: keep_existing_until_ipsec_delete
+
+shutdown:
+  timeout_seconds: 5
