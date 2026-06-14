@@ -1,7 +1,6 @@
 # VectorCore ePDG
 
-VectorCore ePDG is a production-grade Evolved Packet Data Gateway written in Go. It implements the full VoWiFi control plane and userspace datapath as a single self-contained binary with no external IPC dependencies and no reliance on strongSwan.
-
+VectorCore ePDG is an Evolved Packet Data Gateway written in Go. It implements the full VoWiFi control plane and userspace datapath as a single self-contained binary.
 ## What It Does
 
 An ePDG provides untrusted non-3GPP access to the Evolved Packet Core (EPC), enabling devices to use Wi-Fi for VoWiFi voice and data services via a secured IPsec tunnel authenticated with the SIM card (EAP-AKA).
