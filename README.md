@@ -25,7 +25,7 @@ VectorCore ePDG
 ## Features
 
 - **Native Go IKEv2** — Full RFC 7296 state machine: IKE_SA_INIT, IKE_AUTH, CHILD SA, DH key exchange, NAT-T, rekey, reauthentication, DPD
-- **EAP-AKA authentication** — SIM-based auth proxied over SWm Diameter to the HSS/AAA (3GPP TS 29.273); no local credentials required
+- **EAP-AKA authentication** — SIM-based auth proxied over SWm Diameter to the HSS/AAA (3GPP TS 29.273)
 - **Kernel IPsec via XFRM** — Inbound/outbound XFRM SAs and policies installed directly in the Linux kernel; ESP-in-UDP for NAT traversal
 - **MOBIKE (RFC 4555)** — IKEv2 Mobility: negotiated in IKE_AUTH, COOKIE2 return-routability challenge/verify, XFRM endpoint migration when the UE changes IP address (e.g. roaming between Wi-Fi networks); IPv4 only
 - **S2b GTPv2-C** — Creates and manages PDN sessions with the PGW (3GPP TS 29.274); Cisco StarOS interop validated
