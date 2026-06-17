@@ -19,13 +19,8 @@ Known container IDs are from 3GPP TS 24.008 table 10.5.154 and are carried as GT
 | P-CSCF IPv4 Address | `0x000c` |
 | DNS Server IPv4 Address | `0x000d` |
 
-IPv4 Link MTU (`0x0010`) is intentionally not requested or decoded. 3GPP TS
-24.302 §8.2.9.3 only maps PCO-sourced address/DNS/P-CSCF values onto IKEv2
-CFG_REPLY attributes for non-3GPP access; the IKEv2 Configuration Payload
-attribute registry (RFC 7296, plus RFC 7651 for P-CSCF) has no MTU attribute
-at all, so there is no standards-compliant way to deliver it to the UE over
-SWu. The PCO MTU container only has meaning for 3GPP access, where the UE's
-NAS layer parses PCO directly.
+ 3GPP TS 24.302 §8.2.9.3 only maps PCO-sourced address/DNS/P-CSCF values onto IKEv2
+ CFG_REPLY attributes for non-3GPP access; 
 
 ## SWu Delivery
 
