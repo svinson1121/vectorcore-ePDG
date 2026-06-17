@@ -38,7 +38,20 @@ VectorCore ePDG
 - **Reauthentication** — A new IKE_AUTH from an already-attached IMSI+APN (without a handover indication) is treated as an implicit detach of the existing session followed by a fresh PDN attach, per 3GPP TS 23.402
 - **3GPP compliant** — Implements TS 23.402, TS 24.302, TS 29.273, TS 29.274, TS 29.303, TS 33.402
 
-## Requirements
+
+## Related Components
+
+### 3GPP AAA Server
+
+This ePDG can use the [VectorCore AAA Server](https://github.com/svinson1121/vectorcore-aaa) as the 3GPP AAA component for non-3GPP access authentication and authorization.
+
+The AAA server provides the authentication path used by:
+
+- **ePDG** access via **SWm** toward the 3GPP AAA Server
+- AAA/HSS interaction via **SWx**
+- AAA/PGW interaction via **S6b**
+
+## Requirements  
 
 ### Runtime
 
