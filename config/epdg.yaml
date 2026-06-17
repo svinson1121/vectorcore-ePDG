@@ -7,7 +7,7 @@ epdg:
 
 logging:
   level: warn
-  file: /var/log/vectorcore/epdg/epdg.log
+  file: epdg.log
 
 ikev2:
   listen_addr: 0.0.0.0
@@ -57,8 +57,8 @@ pgw_discovery:
   allow_s5s8_fallback: true
 
 bpf:
-  xdp_attach_mode: native   # generic works on any NIC; use native for full performance on supported drivers
-  xdp_interface: ens18       # S2b NIC receiving GTP-U from PGW and used for uplink redirect
+  xdp_attach_mode: generic    # generic works on any NIC; use native for full performance on supported drivers
+  xdp_interface: ens18        # S2b NIC receiving GTP-U from PGW and used for uplink redirect
   map_max_entries: 20480      # one entry per active UE session
 
 dedicated_bearers:
