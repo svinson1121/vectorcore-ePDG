@@ -25,7 +25,6 @@ func testConfig() config.Config {
 	cfg.GTP.LocalGTPC = "10.90.250.55"
 	cfg.GTP.LocalGTPU = "10.90.250.55"
 	cfg.GTP.PGWGTPC = "10.90.250.92"
-	cfg.GTP.PGWGTPU = "10.90.250.92"
 	return cfg
 }
 
@@ -319,7 +318,8 @@ func TestDeleteSessionCauseErrorClassifiesContextNotFound(t *testing.T) {
 
 func TestCreateSessionPayloadIncludesConfiguredPCORequest(t *testing.T) {
 	cfg := testConfig()
-	cfg.PCO.RequestDNS = true
+	cfg.PCO.RequestDNSv4 = true
+	cfg.PCO.RequestDNSv6 = true
 	c := NewClient(cfg, slog.Default())
 	payload := c.createSessionPayload(CreateSessionRequest{
 		IMSI: "311435300070580",

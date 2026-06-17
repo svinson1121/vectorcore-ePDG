@@ -22,7 +22,8 @@ type CreateSessionRequest struct {
 	APN          string
 	AMBRUplink   uint64
 	AMBRDownlink uint64
-	Handover     bool // set Indication IE HI bit (VoLTE→VoWiFi handover, TS 29.274 §8.12)
+	Handover     bool   // set Indication IE HI bit (VoLTE→VoWiFi handover, TS 29.274 §8.12)
+	PGWControlIP net.IP // overrides the static pgw_gtpc peer when non-nil (DNS discovery)
 }
 
 type CreateSessionResult struct {
@@ -53,7 +54,6 @@ type CreateBearerEvent struct {
 	Sequence         uint32
 	Peer             string
 	LinkedDefaultEBI uint8
-	TopLevelEBIs     []CreateBearerEBI
 	BearerContexts   []CreateBearerContext
 	Bearers          []CreateBearerContext
 	EBI              uint8
@@ -63,43 +63,25 @@ type CreateBearerEvent struct {
 	TFTRaw           []byte
 }
 
-type CreateBearerEBI struct {
-	PayloadHex  string
-	RawIEHex    string
-	Offset      int
-	Length      int
-	Instance    uint8
-	EBI         uint8
-	HasEBI      bool
-	DecodeError string
-}
-
 type CreateBearerContext struct {
-	Index           int
-	Instance        uint8
-	RawIEHex        string
-	PayloadHex      string
-	Length          int
-	EBI             uint8
-	HasEBI          bool
-	UnassignedEBI   bool
-	EBIPayloadHex   string
-	EBIRawIEHex     string
-	EBIChildOffset  int
-	EBILength       int
-	EBIInstance     uint8
-	EBIDecodeError  string
-	PGWUserTEID     uint32
-	PGWUserIP       net.IP
-	PGWFTEIDInst    uint8
-	PGWFTEIDIface   uint8
-	PGWFTEIDRawHex  string
-	QCI             uint8
-	HasBearerQoS    bool
-	BearerQoSRawLen int
-	TFTRaw          []byte
-	ChargingID      uint32
-	HasChargingID   bool
+	Index          int
+	Instance       uint8
+	EBI            uint8
+	HasEBI         bool
+	UnassignedEBI  bool
+	EBIPayloadHex  string
+	EBIRawIEHex    string
+	EBIChildOffset int
+	EBIDecodeError string
+	PGWUserTEID    uint32
+	PGWUserIP      net.IP
+	PGWFTEIDInst   uint8
+	PGWFTEIDIface  uint8
+	QCI            uint8
+	HasBearerQoS   bool
+	TFTRaw         []byte
+	ChargingID     uint32
+	HasChargingID  bool
 	RawChildIETypes []uint8
 }
 
@@ -305,11 +287,20 @@ func (c *Client) CreateSession(ctx context.Context, req CreateSessionRequest) (*
 	seq := c.seq.next()
 	payload := c.createSessionPayload(req, ulKbps, dlKbps, localControl, localUser)
 	msg := message{Type: msgCreateSessionReq, TEID: 0, HasTEID: true, Sequence: seq, Payload: payload}
+
+	// Determine the GTPv2-C peer: use DNS-resolved IP when provided, else static config.
+	peer := c.peer
+	if req.PGWControlIP != nil {
+		if ip4 := req.PGWControlIP.To4(); ip4 != nil {
+			peer = &net.UDPAddr{IP: ip4, Port: defaultGTPControlPort}
+		}
+	}
+
 	c.log.Info("S2b Create Session Request sent",
 		"imsi", req.IMSI,
 		"apn", req.APN,
 		"handover", req.Handover,
-		"pgw_gtpc", c.cfg.GTP.PGWGTPC,
+		"pgw_gtpc", peer.IP,
 		"local_gtpc", c.cfg.GTP.LocalGTPC,
 		"local_gtpu", c.cfg.GTP.LocalGTPU,
 		"local_control_teid", localControl,
@@ -320,9 +311,10 @@ func (c *Client) CreateSession(ctx context.Context, req CreateSessionRequest) (*
 		"ambr_dl_kbps", dlKbps,
 		"seq", seq,
 		"pco_enabled", c.cfg.PCO.Enabled,
-		"pco_request_dns", c.cfg.PCO.RequestDNS,
-		"pco_request_pcscf", c.cfg.PCO.RequestPCSCF,
-		"pco_request_mtu", c.cfg.PCO.RequestMTU,
+		"pco_request_dns_v4", c.cfg.PCO.RequestDNSv4,
+		"pco_request_dns_v6", c.cfg.PCO.RequestDNSv6,
+		"pco_request_pcscf_v4", c.cfg.PCO.RequestPCSCFv4,
+		"pco_request_pcscf_v6", c.cfg.PCO.RequestPCSCFv6,
 		"apco_included", c.cfg.PCO.IncludeAPCO,
 	)
 	deadline, hasDeadline := ctx.Deadline()
@@ -338,7 +330,7 @@ func (c *Client) CreateSession(ctx context.Context, req CreateSessionRequest) (*
 		"local_user_teid", localUser,
 		"timeout", timeout,
 	)
-	resp, err := c.transaction(ctx, msg, msgCreateSessionResp)
+	resp, err := c.transactionTo(ctx, msg, msgCreateSessionResp, peer)
 	if err != nil {
 		c.log.Error("S2b Create Session failed",
 			"imsi", req.IMSI,
@@ -369,6 +361,7 @@ func (c *Client) CreateSession(ctx context.Context, req CreateSessionRequest) (*
 		"apn", req.APN,
 		"paa", result.PAA.String(),
 		"pgw_control_teid", result.PGWControlTEID,
+		"pgw_control_ip", result.PGWControlIP,
 		"pgw_user_teid", result.PGWUserTEID,
 		"local_user_teid", result.LocalUserTEID,
 		"ebi", result.EBI,
@@ -383,7 +376,7 @@ func (c *Client) Echo(ctx context.Context) (uint8, error) {
 	resp, err := c.transaction(ctx, message{
 		Type:     msgEchoRequest,
 		Sequence: c.seq.next(),
-		Payload:  recoveryIE(uint8(c.cfg.GTP.Recovery)).encode(),
+		Payload:  recoveryIE(0).encode(),
 	}, msgEchoResponse)
 	if err != nil {
 		return 0, err
@@ -395,7 +388,16 @@ func (c *Client) Echo(ctx context.Context) (uint8, error) {
 	return parseRecovery(ies), nil
 }
 
-func (c *Client) DeleteSession(ctx context.Context, pgwControlTEID, localControlTEID, localUserTEID uint32, ebi uint8) error {
+// DeleteSession sends a GTPv2-C Delete Session Request to the PGW.
+// pgwControlIP is the PGW GTPv2-C control-plane address learned from the Create Session Response
+// F-TEID IE; when nil, the static pgw_gtpc config address is used.
+func (c *Client) DeleteSession(ctx context.Context, pgwControlIP net.IP, pgwControlTEID, localControlTEID, localUserTEID uint32, ebi uint8) error {
+	peer := c.peer
+	if pgwControlIP != nil {
+		if ip4 := pgwControlIP.To4(); ip4 != nil {
+			peer = &net.UDPAddr{IP: ip4, Port: defaultGTPControlPort}
+		}
+	}
 	fteidTEID := localControlTEID
 	if fteidTEID == 0 {
 		fteidTEID = localUserTEID
@@ -404,13 +406,13 @@ func (c *Client) DeleteSession(ctx context.Context, pgwControlTEID, localControl
 		uint8IE(ieEBI, ebi),
 		fteidIE(0, ifaceS2BePDGGTPC, fteidTEID, net.ParseIP(c.cfg.GTP.LocalGTPC)),
 	)
-	resp, err := c.transaction(ctx, message{
+	resp, err := c.transactionTo(ctx, message{
 		Type:     msgDeleteSessionReq,
 		TEID:     pgwControlTEID,
 		HasTEID:  true,
 		Sequence: c.seq.next(),
 		Payload:  payload,
-	}, msgDeleteSessionResp)
+	}, msgDeleteSessionResp, peer)
 	if err != nil {
 		return err
 	}
@@ -423,6 +425,7 @@ func (c *Client) DeleteSession(ctx context.Context, pgwControlTEID, localControl
 	}
 	c.log.Info("S2b Delete Session Response received",
 		"pgw_control_teid", pgwControlTEID,
+		"pgw_control_ip", peer.IP,
 		"local_control_teid", localControlTEID,
 		"local_user_teid", localUserTEID,
 		"ebi", ebi,
@@ -449,7 +452,7 @@ func (c *Client) createSessionPayload(req CreateSessionRequest, ulKbps, dlKbps, 
 		paaIPv4RequestIE(),
 		ambrIE(ulKbps, dlKbps),
 		bearer,
-		recoveryIE(uint8(c.cfg.GTP.Recovery)),
+		recoveryIE(0),
 	}
 	if req.Handover {
 		// TS 29.274 §8.12: Indication IE, octet 3 bit 1 = HI (Handover Indication).
@@ -474,7 +477,6 @@ func (c *Client) parseCreateSessionResponse(resp message, localControl, localUse
 		EBI:              defaultEBI,
 		PGWRecovery:      parseRecovery(ies),
 		PGWControlIP:     net.ParseIP(c.cfg.GTP.PGWGTPC),
-		PGWUserIP:        net.ParseIP(c.cfg.GTP.PGWGTPU),
 	}
 	result.RequestPCO, result.RequestAPCO = c.requestPCO()
 	if result.ResponsePCO, err = c.parsePCOIE(ies, iePCO); err != nil {
@@ -516,6 +518,9 @@ func (c *Client) parseCreateSessionResponse(resp message, localControl, localUse
 	if result.PGWUserTEID == 0 {
 		return nil, fmt.Errorf("S2b Create Session Response missing PGW user TEID")
 	}
+	if result.PGWUserIP == nil {
+		return nil, fmt.Errorf("S2b Create Session Response missing PGW GTP-U IP in bearer context F-TEID")
+	}
 	return result, nil
 }
 
@@ -539,10 +544,10 @@ func (c *Client) requestPCOIEs() []ie {
 }
 
 func (c *Client) requestPCO() (*pco.PCO, *pco.PCO) {
-	if !c.cfg.PCO.Enabled || (!c.cfg.PCO.RequestDNS && !c.cfg.PCO.RequestPCSCF && !c.cfg.PCO.RequestMTU) {
+	if !c.cfg.PCO.Enabled || (!c.cfg.PCO.RequestDNSv4 && !c.cfg.PCO.RequestDNSv6 && !c.cfg.PCO.RequestPCSCFv4 && !c.cfg.PCO.RequestPCSCFv6) {
 		return nil, nil
 	}
-	req := pco.Request(c.cfg.PCO.RequestDNS, c.cfg.PCO.RequestPCSCF, c.cfg.PCO.RequestMTU)
+	req := pco.Request(c.cfg.PCO.RequestDNSv4, c.cfg.PCO.RequestDNSv6, c.cfg.PCO.RequestPCSCFv4, c.cfg.PCO.RequestPCSCFv6)
 	if len(req.Containers) == 0 {
 		return nil, nil
 	}
@@ -577,10 +582,6 @@ func (c *Client) logPCO(label, imsi, apn string, decoded *pco.Decoded) {
 		c.log.Info(label+" absent", "imsi", imsi, "apn", apn)
 		return
 	}
-	mtu := any(nil)
-	if decoded.MTU != nil {
-		mtu = *decoded.MTU
-	}
 	c.log.Info(label+" received",
 		"imsi", imsi,
 		"apn", apn,
@@ -590,7 +591,6 @@ func (c *Client) logPCO(label, imsi, apn string, decoded *pco.Decoded) {
 		"known_dns_v6", pco.IPStrings(decoded.DNSv6),
 		"known_pcscf_v4", pco.IPStrings(decoded.PCSCFv4),
 		"known_pcscf_v6", pco.IPStrings(decoded.PCSCFv6),
-		"mtu", mtu,
 		"unsupported_count", len(decoded.Unsupported),
 	)
 	if len(decoded.PCSCFv4) > 0 || len(decoded.PCSCFv6) > 0 {
@@ -600,9 +600,6 @@ func (c *Client) logPCO(label, imsi, apn string, decoded *pco.Decoded) {
 			"pcscf_v4", pco.IPStrings(decoded.PCSCFv4),
 			"pcscf_v6", pco.IPStrings(decoded.PCSCFv6),
 		)
-	}
-	if decoded.MTU != nil {
-		c.log.Info(label+" MTU stored but not delivered over SWu", "imsi", imsi, "apn", apn, "mtu", *decoded.MTU)
 	}
 }
 
@@ -640,14 +637,6 @@ func findAnyFTEID(ies []ie) (uint8, uint32, net.IP, bool) {
 	return 0, 0, nil, false
 }
 
-func ieTypesFromPayload(payload []byte) []uint8 {
-	ies, err := decodeIEs(payload)
-	if err != nil {
-		return nil
-	}
-	return ieTypes(ies)
-}
-
 func ipString(ip net.IP) string {
 	if ip == nil {
 		return ""
@@ -664,7 +653,14 @@ const (
 	n3Requests = 3
 )
 
+// transaction sends req to the static pgw_gtpc peer and waits for the expected response type.
 func (c *Client) transaction(ctx context.Context, req message, expected uint8) (message, error) {
+	return c.transactionTo(ctx, req, expected, c.peer)
+}
+
+// transactionTo sends req to the given peer and waits for the expected response type.
+// It implements GTPv2-C T3/N3 retransmission (TS 29.274 §6.4).
+func (c *Client) transactionTo(ctx context.Context, req message, expected uint8, peer *net.UDPAddr) (message, error) {
 	encoded, err := req.encode()
 	if err != nil {
 		return message{}, fmt.Errorf("encode GTPv2-C request type=%d seq=%d: %w", req.Type, req.Sequence, err)
@@ -679,8 +675,8 @@ func (c *Client) transaction(ctx context.Context, req message, expected uint8) (
 		c.mu.Unlock()
 	}()
 	for attempt := 1; attempt <= n3Requests; attempt++ {
-		if _, err := c.conn.WriteToUDP(encoded, c.peer); err != nil {
-			return message{}, fmt.Errorf("send GTPv2-C request type=%d seq=%d peer=%s: %w", req.Type, req.Sequence, c.peer.String(), err)
+		if _, err := c.conn.WriteToUDP(encoded, peer); err != nil {
+			return message{}, fmt.Errorf("send GTPv2-C request type=%d seq=%d peer=%s: %w", req.Type, req.Sequence, peer.String(), err)
 		}
 		if attempt > 1 {
 			c.log.Warn("S2b GTPv2-C request retransmitted",
@@ -695,6 +691,7 @@ func (c *Client) transaction(ctx context.Context, req message, expected uint8) (
 			"expected_type", expected,
 			"seq", req.Sequence,
 			"teid", req.TEID,
+			"peer", peer.String(),
 			"attempt", attempt,
 		)
 		select {
@@ -718,7 +715,7 @@ func (c *Client) transaction(ctx context.Context, req message, expected uint8) (
 			return message{}, fmt.Errorf("wait for GTPv2-C response type=%d seq=%d: %w", expected, req.Sequence, ctx.Err())
 		}
 	}
-	return message{}, fmt.Errorf("GTPv2-C no response after %d retransmissions type=%d seq=%d peer=%s", n3Requests, req.Type, req.Sequence, c.peer.String())
+	return message{}, fmt.Errorf("GTPv2-C no response after %d retransmissions type=%d seq=%d peer=%s", n3Requests, req.Type, req.Sequence, peer.String())
 }
 
 func (c *Client) readLoop(ctx context.Context) {
@@ -833,7 +830,7 @@ func (c *Client) handleEchoRequest(req message, peer *net.UDPAddr) {
 		Type:     msgEchoResponse,
 		HasTEID:  req.HasTEID,
 		Sequence: req.Sequence,
-		Payload:  recoveryIE(uint8(c.cfg.GTP.Recovery)).encode(),
+		Payload:  recoveryIE(0).encode(),
 	}
 	encoded, err := resp.encode()
 	if err != nil {
@@ -844,7 +841,7 @@ func (c *Client) handleEchoRequest(req message, peer *net.UDPAddr) {
 		c.log.Warn("S2b Echo Response send failed", "peer", peer.String(), "error", err)
 		return
 	}
-	c.log.Debug("S2b Echo Request handled", "peer", peer.String(), "seq", req.Sequence, "recovery", c.cfg.GTP.Recovery)
+	c.log.Debug("S2b Echo Request handled", "peer", peer.String(), "seq", req.Sequence)
 }
 
 func (c *Client) handleCreateBearerRequest(ctx context.Context, req message, peer *net.UDPAddr) {
@@ -867,52 +864,9 @@ func (c *Client) handleCreateBearerRequest(ctx context.Context, req message, pee
 		"peer", peer.String(),
 		"seq", req.Sequence,
 		"local_control_teid", req.TEID,
-		"payload_hex", hex.EncodeToString(req.Payload),
 	)
 	event, err := parseCreateBearerRequest(req, peer)
 	if err != nil {
-		for _, topEBI := range event.TopLevelEBIs {
-			c.log.Info("S2b Create Bearer top-level EBI found",
-				"payload_hex", topEBI.PayloadHex,
-				"decoded_ebi", topEBI.EBI,
-				"has_ebi", topEBI.HasEBI,
-				"error", topEBI.DecodeError,
-			)
-		}
-		for _, bearer := range event.BearerContexts {
-			c.log.Info("S2b Create Bearer Bearer Context raw",
-				"bearer_context_index", bearer.Index,
-				"instance", bearer.Instance,
-				"length", bearer.Length,
-				"raw_ie_hex", bearer.RawIEHex,
-				"payload_hex", bearer.PayloadHex,
-				"child_ie_types", bearer.RawChildIETypes,
-			)
-		}
-		for _, bearer := range event.BearerContexts {
-			c.log.Info("S2b Create Bearer EBI child IE raw",
-				"bearer_context_index", bearer.Index,
-				"child_offset", bearer.EBIChildOffset,
-				"raw_ie_hex", bearer.EBIRawIEHex,
-				"type", ieEBI,
-				"length", bearer.EBILength,
-				"instance", bearer.EBIInstance,
-				"computed_payload_hex", bearer.EBIPayloadHex,
-				"payload_len", lenHexBytes(bearer.EBIPayloadHex),
-				"decoded_ebi", bearer.EBI,
-				"has_ebi", bearer.HasEBI,
-			)
-			if bearer.EBIDecodeError != "" && !bearer.UnassignedEBI {
-				c.log.Warn("S2b Create Bearer EBI decode failed",
-					"bearer_context_index", bearer.Index,
-					"child_offset", bearer.EBIChildOffset,
-					"raw_ie_hex", bearer.EBIRawIEHex,
-					"payload_len", lenHexBytes(bearer.EBIPayloadHex),
-					"payload_hex", bearer.EBIPayloadHex,
-					"error", bearer.EBIDecodeError,
-				)
-			}
-		}
 		c.log.Warn("S2b Create Bearer Request parse failed",
 			"peer", peer.String(),
 			"seq", req.Sequence,
@@ -924,40 +878,11 @@ func (c *Client) handleCreateBearerRequest(ctx context.Context, req message, pee
 		c.sendBearerResponse(peer, message{Type: msgCreateBearerResp, TEID: req.TEID, HasTEID: true, Sequence: req.Sequence, Payload: ie{Type: ieCause, Payload: []byte{causeContextNotFound, 0}}.encode()})
 		return
 	}
-	c.log.Info("S2b Create Bearer top-level IE summary", "top_level_ie_types", ieTypesFromPayload(req.Payload))
-	for _, topEBI := range event.TopLevelEBIs {
-		c.log.Info("S2b Create Bearer top-level EBI found",
-			"payload_hex", topEBI.PayloadHex,
-			"decoded_ebi", topEBI.EBI,
-			"has_ebi", topEBI.HasEBI,
-			"error", topEBI.DecodeError,
-		)
-	}
 	for _, bearer := range event.BearerContexts {
-		c.log.Info("S2b Create Bearer Bearer Context found",
+		c.log.Debug("S2b Create Bearer Bearer Context found",
 			"bearer_context_index", bearer.Index,
 			"instance", bearer.Instance,
 			"child_ie_types", bearer.RawChildIETypes,
-		)
-		c.log.Info("S2b Create Bearer Bearer Context raw",
-			"bearer_context_index", bearer.Index,
-			"instance", bearer.Instance,
-			"length", bearer.Length,
-			"raw_ie_hex", bearer.RawIEHex,
-			"payload_hex", bearer.PayloadHex,
-			"child_ie_types", bearer.RawChildIETypes,
-		)
-		c.log.Info("S2b Create Bearer EBI child IE raw",
-			"bearer_context_index", bearer.Index,
-			"child_offset", bearer.EBIChildOffset,
-			"raw_ie_hex", bearer.EBIRawIEHex,
-			"type", ieEBI,
-			"length", bearer.EBILength,
-			"instance", bearer.EBIInstance,
-			"computed_payload_hex", bearer.EBIPayloadHex,
-			"payload_len", lenHexBytes(bearer.EBIPayloadHex),
-			"decoded_ebi", bearer.EBI,
-			"has_ebi", bearer.HasEBI,
 		)
 		if bearer.EBIDecodeError != "" && !bearer.UnassignedEBI {
 			c.log.Warn("S2b Create Bearer EBI decode failed",
@@ -979,7 +904,6 @@ func (c *Client) handleCreateBearerRequest(ctx context.Context, req message, pee
 			"ipv4", ipString(bearer.PGWUserIP),
 			"pgw_fteid_instance", bearer.PGWFTEIDInst,
 			"pgw_fteid_iface", bearer.PGWFTEIDIface,
-			"pgw_fteid_raw_hex", bearer.PGWFTEIDRawHex,
 		)
 		c.log.Info("S2b Create Bearer QoS parsed",
 			"ebi", bearer.EBI,
@@ -1048,12 +972,6 @@ func (c *Client) handleCreateBearerRequest(ctx context.Context, req message, pee
 			fteidFoundInstance = fteid.Instance
 			_, fteidTEID, fteidIP, fteidPresent = parseFTEID(fteid)
 		}
-		c.log.Info("S2b Create Bearer Response F-TEID semantic",
-			"semantic", "s2b_epdg_data_teid",
-			"ie_type", ieFTEID,
-			"ie_instance", logFTEIDInstance,
-			"interface_type", logFTEIDIface,
-		)
 		c.log.Info("S2b Create Bearer Response bearer context encoded",
 			"seq", req.Sequence,
 			"bearer_index", i-1,
@@ -1065,7 +983,6 @@ func (c *Client) handleCreateBearerRequest(ctx context.Context, req message, pee
 			"fteid_interface_name", fteidInterfaceName(logFTEIDIface),
 			"fteid_teid", fteidTEID,
 			"fteid_ipv4", ipString(fteidIP),
-			"raw_bearer_context_hex", hex.EncodeToString(top.encode()),
 		)
 	}
 	encoded, err := resp.encode()
@@ -1078,7 +995,6 @@ func (c *Client) handleCreateBearerRequest(ctx context.Context, req message, pee
 		"peer", peer.String(),
 		"seq", req.Sequence,
 		"teid", fmt.Sprintf("0x%08x", resp.TEID),
-		"response_hex", hex.EncodeToString(encoded),
 		"bearers", bearerEBIs,
 	)
 	if _, err := c.conn.WriteToUDP(encoded, peer); err != nil {
@@ -1281,12 +1197,8 @@ func (c *Client) createBearerResponseMessage(req message, result CreateBearerRes
 			// TS 29.274 Table 7.2.4-2: S2b-U ePDG GTP-U at instance=8, iface=31.
 			children = append(children, fteidIE(8, ifaceS2BePDGGTPU, br.LocalUserTEID, ip))
 			// TS 29.274 Table 7.2.4-2: S2b-U PGW GTP-U echo at instance=9, iface=33.
-			if br.PGWUserTEID != 0 {
-				pgwIP := br.PGWUserIP
-				if pgwIP == nil {
-					pgwIP = net.ParseIP(c.cfg.GTP.PGWGTPU)
-				}
-				children = append(children, fteidIE(9, ifaceS2BPGWGTPU, br.PGWUserTEID, pgwIP))
+			if br.PGWUserTEID != 0 && br.PGWUserIP != nil {
+				children = append(children, fteidIE(9, ifaceS2BPGWGTPU, br.PGWUserTEID, br.PGWUserIP))
 			}
 			// Cisco ePDG admin guide §16c: CBR response bearer context is
 			// (EBI, Cause, S2b-U ePDG F-TEID, S2b-U PGW F-TEID) — QoS omitted.
@@ -1303,7 +1215,7 @@ func (c *Client) createBearerResponseMessage(req message, result CreateBearerRes
 		payloadIEs = append(payloadIEs, ie{Type: ieBearerContext, Instance: 0, Payload: encodeIEs(children...)})
 	}
 	// Recovery IE is standard in GTPv2-C responses (TS 29.274 Table 7.2.4-1).
-	payloadIEs = append(payloadIEs, recoveryIE(uint8(c.cfg.GTP.Recovery)))
+	payloadIEs = append(payloadIEs, recoveryIE(0))
 	// TS 29.274 §6.1.1: response TEID = PGW's control TEID so StarOS routes
 	// the message to the right session. The CBR request carried ePDG's local TEID
 	// in the header; the response must address the PGW's TEID instead.
@@ -1389,23 +1301,9 @@ func parseCreateBearerRequest(req message, peer *net.UDPAddr) (CreateBearerEvent
 	bearerContextIndex := 0
 	for _, top := range ies {
 		if top.Type == ieEBI {
-			topEBI := CreateBearerEBI{
-				PayloadHex: hex.EncodeToString(top.Payload),
-				RawIEHex:   hex.EncodeToString(top.Raw),
-				Offset:     top.Offset,
-				Length:     top.Length,
-				Instance:   top.Instance,
+			if ebi, err := parseEBI(top.Payload); err == nil && event.LinkedDefaultEBI == 0 {
+				event.LinkedDefaultEBI = ebi
 			}
-			if ebi, err := parseEBI(top.Payload); err == nil {
-				topEBI.EBI = ebi
-				topEBI.HasEBI = true
-				if event.LinkedDefaultEBI == 0 {
-					event.LinkedDefaultEBI = ebi
-				}
-			} else {
-				topEBI.DecodeError = err.Error()
-			}
-			event.TopLevelEBIs = append(event.TopLevelEBIs, topEBI)
 		}
 		if top.Type != ieBearerContext {
 			continue
@@ -1418,9 +1316,6 @@ func parseCreateBearerRequest(req message, peer *net.UDPAddr) (CreateBearerEvent
 		ctx := CreateBearerContext{
 			Index:           bearerContextIndex,
 			Instance:        top.Instance,
-			RawIEHex:        hex.EncodeToString(top.Raw),
-			PayloadHex:      hex.EncodeToString(top.Payload),
-			Length:          top.Length,
 			RawChildIETypes: ieTypesFromDecoded(children),
 		}
 		bearerContextIndex++
@@ -1430,8 +1325,6 @@ func parseCreateBearerRequest(req message, peer *net.UDPAddr) (CreateBearerEvent
 				ctx.EBIPayloadHex = hex.EncodeToString(child.Payload)
 				ctx.EBIRawIEHex = hex.EncodeToString(child.Raw)
 				ctx.EBIChildOffset = child.Offset
-				ctx.EBILength = child.Length
-				ctx.EBIInstance = child.Instance
 				if ebi, err := parseEBI(child.Payload); err == nil {
 					ctx.EBI = ebi
 					ctx.HasEBI = true
@@ -1447,11 +1340,9 @@ func parseCreateBearerRequest(req message, peer *net.UDPAddr) (CreateBearerEvent
 					ctx.PGWUserIP = ip
 					ctx.PGWFTEIDInst = child.Instance
 					ctx.PGWFTEIDIface = iface
-					ctx.PGWFTEIDRawHex = hex.EncodeToString(child.Raw)
 				}
 			case ieBearerQoS:
 				ctx.HasBearerQoS = true
-				ctx.BearerQoSRawLen = len(child.Payload)
 				if len(child.Payload) > 1 {
 					ctx.QCI = child.Payload[1]
 				}

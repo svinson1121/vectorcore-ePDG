@@ -6,7 +6,7 @@ import (
 )
 
 func TestRequestEncodeDecode(t *testing.T) {
-	req := Request(true, true, true)
+	req := Request(true, true, true, true)
 	payload, err := Encode(req)
 	if err != nil {
 		t.Fatalf("Encode() error = %v", err)
@@ -18,7 +18,7 @@ func TestRequestEncodeDecode(t *testing.T) {
 	if decoded == nil || decoded.PCO == nil || !decoded.PCO.Extension {
 		t.Fatalf("decoded PCO = %#v", decoded)
 	}
-	if got, want := len(decoded.PCO.Containers), 5; got != want {
+	if got, want := len(decoded.PCO.Containers), 4; got != want {
 		t.Fatalf("container count = %d, want %d", got, want)
 	}
 }
@@ -28,7 +28,6 @@ func TestDecodeKnownContainers(t *testing.T) {
 		0x80,
 		0x00, 0x0d, 0x08, 8, 8, 8, 8, 8, 8, 4, 4,
 		0x00, 0x0c, 0x04, 10, 0, 0, 31,
-		0x00, 0x10, 0x02, 0x05, 0xdc,
 	}
 	decoded, err := Decode(payload, false)
 	if err != nil {
@@ -39,9 +38,6 @@ func TestDecodeKnownContainers(t *testing.T) {
 	}
 	if len(decoded.PCSCFv4) != 1 || !decoded.PCSCFv4[0].Equal(net.ParseIP("10.0.0.31")) {
 		t.Fatalf("PCSCFv4 = %v", IPStrings(decoded.PCSCFv4))
-	}
-	if decoded.MTU == nil || *decoded.MTU != 1500 {
-		t.Fatalf("MTU = %v", decoded.MTU)
 	}
 }
 

@@ -20,7 +20,9 @@ import (
 	"strings"
 	"time"
 
+	"vectorcore-epdg/internal/config"
 	"vectorcore-epdg/internal/pco"
+	"vectorcore-epdg/internal/pgwdiscovery"
 	"vectorcore-epdg/internal/s2b"
 	"vectorcore-epdg/internal/session"
 	"vectorcore-epdg/internal/swm"
@@ -48,8 +50,8 @@ type rawPayload struct {
 }
 
 func (p *rawPayload) Type() message.IkePayloadType { return p.typ }
-func (p *rawPayload) Marshal() ([]byte, error)      { return p.data, nil }
-func (p *rawPayload) Unmarshal(b []byte) error      { p.data = append(p.data[:0], b...); return nil }
+func (p *rawPayload) Marshal() ([]byte, error)     { return p.data, nil }
+func (p *rawPayload) Unmarshal(b []byte) error     { p.data = append(p.data[:0], b...); return nil }
 
 // authPayloads holds inner payloads parsed from an IKE_AUTH request.
 type authPayloads struct {
@@ -387,6 +389,22 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 
 	s.log.Info("IKE_AUTH final: UE AUTH verified", "imsi", sa.imsi, "remote", remote)
 
+	// TS 23.402 §8.2.2: a re-attach without a handover indication is an implicit
+	// detach of any existing active session for this IMSI+APN.  We wait until after
+	// AUTH verification so we never tear down a valid session on an unverified claim.
+	if sa.handoverIP == nil && s.sessions != nil {
+		if oldSess, ok := s.sessions.FindSingleActiveByIMSIAPN(sa.imsi, sa.apn); ok {
+			if oldIKESA := s.lookupSA(oldSess.IkeSPII); oldIKESA != nil {
+				oldIKESA.mu.Lock()
+				oldIKESA.state = ikeStateDeleting
+				s.fullTeardown(oldIKESA, "implicit_detach")
+				oldIKESA.mu.Unlock()
+				s.log.Info("IKE_AUTH final: implicitly detached existing session",
+					"imsi", sa.imsi, "old_session_id", oldSess.ID)
+			}
+		}
+	}
+
 	// S2b CreateSession to obtain the UE's PAA.
 	var paa net.IP
 	var s2bResult *s2b.CreateSessionResult
@@ -398,6 +416,21 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 				ambrDL = sess.APNProfile.AMBRDownlink
 			}
 		}
+
+		// Resolve PGW-C address per 3GPP TS 29.303 (DNS) or static config.
+		var pgwControlIP net.IP
+		if s.fullCfg != nil {
+			dnsCtx, dnsCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			pgwControlIP = pgwdiscovery.Discover(dnsCtx, s.log, pgwdiscovery.Config{
+				DNSEnabled:        s.fullCfg.PGWDiscovery.DNSEnabled,
+				AllowS5S8Fallback: s.fullCfg.PGWDiscovery.AllowS5S8Fallback,
+				StaticPGWC:        s.fullCfg.GTP.PGWGTPC,
+				MCC:               s.fullCfg.EPDG.MCC,
+				MNC:               s.fullCfg.EPDG.MNC,
+			}, sa.apn)
+			dnsCancel()
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		r, err := s.s2b.CreateSession(ctx, s2b.CreateSessionRequest{
 			IMSI:         sa.imsi,
@@ -405,6 +438,7 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 			AMBRUplink:   ambrUL,
 			AMBRDownlink: ambrDL,
 			Handover:     sa.handoverIP != nil,
+			PGWControlIP: pgwControlIP,
 		})
 		cancel()
 		if err != nil {
@@ -432,7 +466,9 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 				sess.S2B = &session.S2BContext{
 					PAA:              paa.String(),
 					PGWControlTEID:   r.PGWControlTEID,
+					PGWControlIP:     r.PGWControlIP,
 					PGWUserTEID:      r.PGWUserTEID,
+					PGWUserIP:        r.PGWUserIP,
 					LocalControlTEID: r.LocalControlTEID,
 					LocalUserTEID:    r.LocalUserTEID,
 					EBI:              r.EBI,
@@ -484,6 +520,7 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 			NATTDstPort:  remote.Port,
 			LocalTS:      localTS,
 			RemoteTS:     remoteTS,
+			IfID:         xfrm.IfID,
 		}
 		if err := xfrm.InstallChildSA(xfrmParams); err != nil {
 			s.log.Error("IKE_AUTH final: XFRM install failed",
@@ -553,8 +590,10 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 			if pcoData == nil {
 				pcoData = s2bResult.ResponsePCO
 			}
-			appendDNSFromPCO(cp, pcoData)
-			appendPCSCFFromPCO(cp, pcoData)
+			if s.fullCfg != nil {
+				appendDNSFromPCO(cp, pcoData, s.fullCfg.PCO)
+				appendPCSCFFromPCO(cp, pcoData, s.fullCfg.PCO)
+			}
 		}
 	}
 
@@ -650,8 +689,8 @@ func buildIKEHeaderBytes(spiI, spiR uint64, exchType uint8, msgID uint32, totalL
 	hdr := make([]byte, message.IKE_HEADER_LEN)
 	binary.BigEndian.PutUint64(hdr[0:], spiI)
 	binary.BigEndian.PutUint64(hdr[8:], spiR)
-	hdr[16] = uint8(message.TypeSK)    // NextPayload = SK
-	hdr[17] = (2 << 4) | 0            // MajorVersion=2, MinorVersion=0
+	hdr[16] = uint8(message.TypeSK) // NextPayload = SK
+	hdr[17] = (2 << 4) | 0          // MajorVersion=2, MinorVersion=0
 	hdr[18] = exchType
 	hdr[19] = message.ResponseBitCheck // Response flag, no Initiator flag
 	binary.BigEndian.PutUint32(hdr[20:], msgID)
@@ -667,7 +706,7 @@ func buildIKERequestHeaderBytes(spiI, spiR uint64, exchType uint8, msgID uint32,
 	binary.BigEndian.PutUint64(hdr[0:], spiI)
 	binary.BigEndian.PutUint64(hdr[8:], spiR)
 	hdr[16] = uint8(message.TypeSK) // NextPayload = SK
-	hdr[17] = (2 << 4) | 0         // MajorVersion=2, MinorVersion=0
+	hdr[17] = (2 << 4) | 0          // MajorVersion=2, MinorVersion=0
 	hdr[18] = exchType
 	hdr[19] = 0x00 // no Response, no Initiator — ePDG is IKE responder sending a request
 	binary.BigEndian.PutUint32(hdr[20:], msgID)
@@ -825,8 +864,9 @@ func (s *Server) epdgIdentity() string {
 // ────────────────────────────────────────────────────────────────────────────
 
 // computeEAPAUTH computes the MSK-based AUTH value per RFC 7296 §2.15:
-//   auth_key = prf(MSK, "Key Pad for IKEv2")
-//   AUTH     = prf(auth_key, signedOctets)
+//
+//	auth_key = prf(MSK, "Key Pad for IKEv2")
+//	AUTH     = prf(auth_key, signedOctets)
 func computeEAPAUTH(prf *prfAlg, msk, signedOctets []byte) []byte {
 	authKey := prfMAC(prf, msk, []byte(ikeV2KeyPad))
 	return prfMAC(prf, authKey, signedOctets)
@@ -955,29 +995,42 @@ const (
 	internalIP6PCSCF = uint16(21) // P_CSCF_IP6_ADDRESS (RFC 7651 §3)
 )
 
-func appendDNSFromPCO(cp *message.Configuration, decoded *pco.Decoded) {
+func appendDNSFromPCO(cp *message.Configuration, decoded *pco.Decoded, cfg config.PCOConfig) {
 	if decoded == nil {
 		return
 	}
-	for _, ip := range decoded.DNSv4 {
-		if ip4 := ip.To4(); ip4 != nil {
-			cp.ConfigurationAttribute.BuildConfigurationAttribute(message.INTERNAL_IP4_DNS, ip4)
+	if cfg.RequestDNSv4 {
+		for _, ip := range decoded.DNSv4 {
+			if ip4 := ip.To4(); ip4 != nil {
+				cp.ConfigurationAttribute.BuildConfigurationAttribute(message.INTERNAL_IP4_DNS, ip4)
+			}
+		}
+	}
+	if cfg.RequestDNSv6 {
+		for _, ip := range decoded.DNSv6 {
+			if ip16 := ip.To16(); ip16 != nil {
+				cp.ConfigurationAttribute.BuildConfigurationAttribute(message.INTERNAL_IP6_DNS, ip16)
+			}
 		}
 	}
 }
 
-func appendPCSCFFromPCO(cp *message.Configuration, decoded *pco.Decoded) {
+func appendPCSCFFromPCO(cp *message.Configuration, decoded *pco.Decoded, cfg config.PCOConfig) {
 	if decoded == nil {
 		return
 	}
-	for _, ip := range decoded.PCSCFv4 {
-		if ip4 := ip.To4(); ip4 != nil {
-			cp.ConfigurationAttribute.BuildConfigurationAttribute(internalIP4PCSCF, ip4)
+	if cfg.RequestPCSCFv4 {
+		for _, ip := range decoded.PCSCFv4 {
+			if ip4 := ip.To4(); ip4 != nil {
+				cp.ConfigurationAttribute.BuildConfigurationAttribute(internalIP4PCSCF, ip4)
+			}
 		}
 	}
-	for _, ip := range decoded.PCSCFv6 {
-		if ip16 := ip.To16(); ip16 != nil {
-			cp.ConfigurationAttribute.BuildConfigurationAttribute(internalIP6PCSCF, ip16)
+	if cfg.RequestPCSCFv6 {
+		for _, ip := range decoded.PCSCFv6 {
+			if ip16 := ip.To16(); ip16 != nil {
+				cp.ConfigurationAttribute.BuildConfigurationAttribute(internalIP6PCSCF, ip16)
+			}
 		}
 	}
 }

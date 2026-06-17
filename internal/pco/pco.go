@@ -13,7 +13,6 @@ const (
 	ContainerDNSIPv6   uint16 = 0x0003
 	ContainerPCSCFIPv4 uint16 = 0x000c
 	ContainerDNSIPv4   uint16 = 0x000d
-	ContainerIPv4MTU   uint16 = 0x0010
 )
 
 type Container struct {
@@ -32,7 +31,6 @@ type Decoded struct {
 	DNSv6       []net.IP
 	PCSCFv4     []net.IP
 	PCSCFv6     []net.IP
-	MTU         *uint16
 	Unsupported []Container
 }
 
@@ -91,22 +89,19 @@ func Encode(p PCO) ([]byte, error) {
 	return out, nil
 }
 
-func Request(dns, pcscf, mtu bool) PCO {
+func Request(dnsV4, dnsV6, pcscfV4, pcscfV6 bool) PCO {
 	var containers []Container
-	if pcscf {
-		containers = append(containers,
-			Container{ProtocolID: ContainerPCSCFIPv6},
-			Container{ProtocolID: ContainerPCSCFIPv4},
-		)
+	if pcscfV6 {
+		containers = append(containers, Container{ProtocolID: ContainerPCSCFIPv6})
 	}
-	if dns {
-		containers = append(containers,
-			Container{ProtocolID: ContainerDNSIPv6},
-			Container{ProtocolID: ContainerDNSIPv4},
-		)
+	if pcscfV4 {
+		containers = append(containers, Container{ProtocolID: ContainerPCSCFIPv4})
 	}
-	if mtu {
-		containers = append(containers, Container{ProtocolID: ContainerIPv4MTU})
+	if dnsV6 {
+		containers = append(containers, Container{ProtocolID: ContainerDNSIPv6})
+	}
+	if dnsV4 {
+		containers = append(containers, Container{ProtocolID: ContainerDNSIPv4})
 	}
 	return PCO{Extension: true, Containers: containers}
 }
@@ -153,13 +148,6 @@ func (d *Decoded) decodeKnown(c Container, strict bool) {
 			d.Unsupported = append(d.Unsupported, c)
 		}
 		d.PCSCFv6 = appendIPv6(d.PCSCFv6, c.Contents)
-	case ContainerIPv4MTU:
-		if len(c.Contents) == 2 {
-			mtu := binary.BigEndian.Uint16(c.Contents)
-			d.MTU = &mtu
-		} else {
-			d.Unsupported = append(d.Unsupported, c)
-		}
 	default:
 		d.Unsupported = append(d.Unsupported, c)
 	}

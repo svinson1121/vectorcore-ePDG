@@ -22,8 +22,6 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("logging.level must be one of debug, info, warn, error"))
 	}
 
-	require(&errs, c.IPC.EPDGRequestSocket, "ipc.epdg_request_socket")
-
 	requireIP(&errs, c.SWM.LocalAddr, "swm.local_addr")
 	requireIP(&errs, c.SWM.PeerAddr, "swm.peer_addr")
 	requirePort(&errs, c.SWM.PeerPort, "swm.peer_port")
@@ -46,49 +44,24 @@ func (c *Config) Validate() error {
 	requireIP(&errs, c.GTP.LocalGTPU, "gtp.local_gtpu")
 	requirePort(&errs, c.GTP.LocalPort, "gtp.local_port")
 	requireIP(&errs, c.GTP.PGWGTPC, "gtp.pgw_gtpc")
-	requireIP(&errs, c.GTP.PGWGTPU, "gtp.pgw_gtpu")
-	require(&errs, c.GTP.TunName, "gtp.tun_name")
 	if c.GTP.MTU < 576 || c.GTP.MTU > 9000 {
 		errs = append(errs, fmt.Errorf("gtp.mtu must be between 576 and 9000"))
 	}
-	switch c.GTP.UplinkCapture.Mode {
-	case "nfqueue":
-	default:
-		errs = append(errs, fmt.Errorf("gtp.uplink_capture_mode must be nfqueue"))
-	}
-	if c.GTP.UplinkCapture.QueueNum < 0 || c.GTP.UplinkCapture.QueueNum > 65535 {
-		errs = append(errs, fmt.Errorf("gtp.nfqueue_queue_num must be between 0 and 65535"))
-	}
-	switch c.GTP.UplinkCapture.FirewallBackend {
-	case "iptables":
-	default:
-		errs = append(errs, fmt.Errorf("gtp.nfqueue_firewall_backend must be iptables"))
-	}
-	require(&errs, c.GTP.UplinkCapture.ChainName, "gtp.nfqueue_chain_name")
 
 	require(&errs, c.APN.Default, "apn.default")
 
-	if c.Datapath.UplinkPolicyRoutingEnabled {
-		if c.Datapath.UplinkTableID <= 0 {
-			errs = append(errs, fmt.Errorf("datapath.uplink_table_id must be greater than 0"))
-		}
-		if c.Datapath.UplinkPriorityBase <= 0 {
-			errs = append(errs, fmt.Errorf("datapath.uplink_priority_base must be greater than 0"))
-		}
-	}
-	switch c.Reauth.Mode {
-	case "preserve_existing_s2b", "detach_new_attach":
-	default:
-		errs = append(errs, fmt.Errorf("reauth.mode must be preserve_existing_s2b or detach_new_attach"))
-	}
-	switch c.Reauth.OnFailure {
-	case "keep_existing_until_ipsec_delete", "delete_existing_session":
-	default:
-		errs = append(errs, fmt.Errorf("reauth.on_failure must be keep_existing_until_ipsec_delete or delete_existing_session"))
-	}
 	if c.Shutdown.TimeoutSeconds <= 0 {
 		errs = append(errs, fmt.Errorf("shutdown.timeout_seconds must be greater than 0"))
 	}
+	switch c.GTP.BPF.XDPAttachMode {
+	case "generic", "native", "offload":
+	default:
+		errs = append(errs, fmt.Errorf("bpf.xdp_attach_mode must be generic, native, or offload"))
+	}
+	if c.GTP.BPF.MapMaxEntries <= 0 {
+		errs = append(errs, fmt.Errorf("bpf.map_max_entries must be greater than 0"))
+	}
+	require(&errs, c.GTP.BPF.XDPInterface, "bpf.xdp_interface")
 
 	return errors.Join(errs...)
 }

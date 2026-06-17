@@ -10,6 +10,11 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+const (
+	IfName = "vc-xfrm0" // XFRM virtual interface; decrypted UE packets arrive here
+	IfID   = uint32(1)  // if_id stamped on XFRM SAs; must match vc-xfrm0 if_id
+)
+
 // ChildSAParams contains all parameters needed to program one bidirectional ESP CHILD SA.
 type ChildSAParams struct {
 	// Outer tunnel endpoints: real IP addresses of the IPsec peers.
@@ -39,6 +44,12 @@ type ChildSAParams struct {
 	// Traffic selectors for XFRM policy (inner addresses, not outer tunnel endpoints).
 	LocalTS  *net.IPNet // ePDG inner: 0.0.0.0/0 (accepts all)
 	RemoteTS *net.IPNet // UE inner: PAA/32 (PGW-assigned address)
+
+	// IfID, when non-zero, ties these SAs to an XFRM virtual interface (type xfrm)
+	// with the matching if_id. Decrypted uplink packets are then delivered to that
+	// interface where TC-BPF can encapsulate them. XFRM policies are skipped when
+	// IfID is set.
+	IfID uint32
 }
 
 // InstallChildSA programs inbound and outbound XFRM SAs and policies in the kernel.
@@ -70,7 +81,7 @@ func InstallChildSA(p ChildSAParams) error {
 		_ = netlink.XfrmPolicyDel(inPol)
 		_ = netlink.XfrmStateDel(inbound)
 		_ = netlink.XfrmStateDel(outbound)
-		return fmt.Errorf("xfrm: add forward policy: %w", err)
+		return fmt.Errorf("xfrm: add uplink forward policy: %w", err)
 	}
 	if err := netlink.XfrmPolicyAdd(outPol); err != nil {
 		_ = netlink.XfrmPolicyDel(fwdPol)
@@ -102,7 +113,6 @@ func RemoveChildSA(p ChildSAParams) error {
 		return fmt.Errorf("xfrm: only IPv4 supported")
 	}
 
-	inPol, fwdPol, outPol := buildPolicies(p, localIP4, remoteIP4)
 	inbound, outbound := buildSAs(p, localIP4, remoteIP4)
 
 	var firstErr error
@@ -112,6 +122,7 @@ func RemoveChildSA(p ChildSAParams) error {
 		}
 	}
 
+	inPol, fwdPol, outPol := buildPolicies(p, localIP4, remoteIP4)
 	save(netlink.XfrmPolicyDel(outPol))
 	save(netlink.XfrmPolicyDel(fwdPol))
 	save(netlink.XfrmPolicyDel(inPol))
@@ -131,6 +142,7 @@ func buildSAs(p ChildSAParams, localIP4, remoteIP4 net.IP) (*netlink.XfrmState, 
 		Mode:         netlink.XFRM_MODE_TUNNEL,
 		Spi:          int(p.InboundSPI),
 		ReplayWindow: 32,
+		Ifid:         int(p.IfID),
 		Auth: &netlink.XfrmStateAlgo{
 			Name:        p.IntAlgName,
 			Key:         p.IntKeyIn,
@@ -157,6 +169,7 @@ func buildSAs(p ChildSAParams, localIP4, remoteIP4 net.IP) (*netlink.XfrmState, 
 		Mode:         netlink.XFRM_MODE_TUNNEL,
 		Spi:          int(p.OutboundSPI),
 		ReplayWindow: 32,
+		Ifid:         int(p.IfID),
 		Auth: &netlink.XfrmStateAlgo{
 			Name:        p.IntAlgName,
 			Key:         p.IntKeyOut,
@@ -184,37 +197,96 @@ func buildPolicies(p ChildSAParams, localIP4, remoteIP4 net.IP) (*netlink.XfrmPo
 		Proto: netlink.XFRM_PROTO_ESP,
 		Mode:  netlink.XFRM_MODE_TUNNEL,
 	}
-	// Inbound policy: for traffic destined to the local machine after decryption.
+	tmplOut := netlink.XfrmPolicyTmpl{
+		Src:   localIP4,
+		Dst:   remoteIP4,
+		Proto: netlink.XFRM_PROTO_ESP,
+		Mode:  netlink.XFRM_MODE_TUNNEL,
+	}
+	// Inbound policy: UE→ePDG traffic must arrive via ESP tunnel.
 	inPol := &netlink.XfrmPolicy{
 		Src:      p.RemoteTS,
 		Dst:      p.LocalTS,
 		Dir:      netlink.XFRM_DIR_IN,
 		Priority: 100,
+		Ifid:     int(p.IfID),
 		Tmpls:    []netlink.XfrmPolicyTmpl{tmplIn},
 	}
-	// Forward policy: required for UE traffic that is decrypted and then forwarded
-	// (not delivered locally). Without this the kernel silently drops the inner packet.
+	// Uplink forward policy: verifies decrypted UE traffic was protected by the inbound SA.
 	fwdPol := &netlink.XfrmPolicy{
 		Src:      p.RemoteTS,
 		Dst:      p.LocalTS,
 		Dir:      netlink.XFRM_DIR_FWD,
 		Priority: 100,
+		Ifid:     int(p.IfID),
 		Tmpls:    []netlink.XfrmPolicyTmpl{tmplIn},
 	}
-	// Outbound policy: inner packets from ePDG (0.0.0.0/0) to UE (PAA/32).
+	// Outbound policy: any traffic to UE PAA (locally originated OR forwarded via kernel
+	// routing, including XDP-decapped GTP-U inner IP) is encrypted via the outbound SA.
 	outPol := &netlink.XfrmPolicy{
 		Src:      p.LocalTS,
 		Dst:      p.RemoteTS,
 		Dir:      netlink.XFRM_DIR_OUT,
 		Priority: 100,
-		Tmpls: []netlink.XfrmPolicyTmpl{{
-			Src:   localIP4,
-			Dst:   remoteIP4,
-			Proto: netlink.XFRM_PROTO_ESP,
-			Mode:  netlink.XFRM_MODE_TUNNEL,
-		}},
+		Ifid:     int(p.IfID),
+		Tmpls:    []netlink.XfrmPolicyTmpl{tmplOut},
 	}
 	return inPol, fwdPol, outPol
+}
+
+// AddChildSAStates installs only the inbound and outbound XFRM SA states for a CHILD SA
+// without touching policies. Used during CHILD SA rekey where policies already exist.
+func AddChildSAStates(p ChildSAParams) error {
+	localIP4 := p.LocalIP.To4()
+	remoteIP4 := p.RemoteIP.To4()
+	if localIP4 == nil || remoteIP4 == nil {
+		return fmt.Errorf("xfrm: only IPv4 supported (local=%v remote=%v)", p.LocalIP, p.RemoteIP)
+	}
+	inbound, outbound := buildSAs(p, localIP4, remoteIP4)
+	if err := netlink.XfrmStateAdd(inbound); err != nil {
+		return fmt.Errorf("xfrm: add inbound SA (spi=%08x): %w", p.InboundSPI, err)
+	}
+	if err := netlink.XfrmStateAdd(outbound); err != nil {
+		_ = netlink.XfrmStateDel(inbound)
+		return fmt.Errorf("xfrm: add outbound SA (spi=%08x): %w", p.OutboundSPI, err)
+	}
+	return nil
+}
+
+// RemoveChildSAStates removes only the XFRM SA states for a CHILD SA, without touching
+// policies. Used when removing the old SA after a successful rekey, or aborting a rekey.
+// Keys are not required — the kernel identifies SAs by SPI and endpoints only.
+func RemoveChildSAStates(p ChildSAParams) error {
+	localIP4 := p.LocalIP.To4()
+	remoteIP4 := p.RemoteIP.To4()
+	if localIP4 == nil || remoteIP4 == nil {
+		return fmt.Errorf("xfrm: only IPv4 supported")
+	}
+	inbound := &netlink.XfrmState{
+		Src:   remoteIP4,
+		Dst:   localIP4,
+		Proto: netlink.XFRM_PROTO_ESP,
+		Mode:  netlink.XFRM_MODE_TUNNEL,
+		Spi:   int(p.InboundSPI),
+		Ifid:  int(p.IfID),
+	}
+	outbound := &netlink.XfrmState{
+		Src:   localIP4,
+		Dst:   remoteIP4,
+		Proto: netlink.XFRM_PROTO_ESP,
+		Mode:  netlink.XFRM_MODE_TUNNEL,
+		Spi:   int(p.OutboundSPI),
+		Ifid:  int(p.IfID),
+	}
+	var firstErr error
+	save := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	save(netlink.XfrmStateDel(outbound))
+	save(netlink.XfrmStateDel(inbound))
+	return firstErr
 }
 
 // MigrateChildSA updates the outer tunnel endpoints of an existing CHILD SA without

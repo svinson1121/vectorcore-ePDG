@@ -3,7 +3,6 @@ package config
 import (
 	"bufio"
 	"fmt"
-	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -17,17 +16,24 @@ const (
 )
 
 type Config struct {
-	EPDG     EPDGConfig
-	Logging  LoggingConfig
-	IPC      IPCConfig
-	IKEv2    IKEv2Config
-	SWM      SWMConfig
-	GTP      GTPConfig
-	APN      APNConfig
-	PCO      PCOConfig
-	Datapath DatapathConfig
-	Reauth   ReauthConfig
-	Shutdown ShutdownConfig
+	EPDG         EPDGConfig
+	Logging      LoggingConfig
+	IKEv2        IKEv2Config
+	SWM          SWMConfig
+	GTP          GTPConfig
+	APN          APNConfig
+	PCO          PCOConfig
+	Shutdown     ShutdownConfig
+	PGWDiscovery PGWDiscoveryConfig
+}
+
+type PGWDiscoveryConfig struct {
+	// DNSEnabled enables per-attach DNS PGW discovery per 3GPP TS 29.303.
+	// When false (default), pgw_gtpc is used directly.
+	DNSEnabled bool
+	// AllowS5S8Fallback allows falling back to x-s5-gtp/x-s8-gtp NAPTR records
+	// when no x-s2b-gtp record is present in DNS.
+	AllowS5S8Fallback bool
 }
 
 type IKEv2Config struct {
@@ -42,6 +48,8 @@ type IKEv2Config struct {
 	KeyFile string
 	// CAFile is the path to the CA certificate for UE cert validation (PEM).
 	CAFile string
+	// DPDEnabled controls whether Dead Peer Detection is active. Default true.
+	DPDEnabled bool
 	// DPDDelay is the idle time in seconds before sending a DPD probe. Default 30.
 	DPDDelay int
 	// DPDTimeout is the seconds to wait for a DPD response before tearing down. Default 120.
@@ -59,20 +67,6 @@ type EPDGConfig struct {
 type LoggingConfig struct {
 	Level string
 	File  string
-}
-
-type IPCConfig struct {
-	// EPDGRequestSocket is owned by ePDG; the strongSwan plugin connects here
-	// for auth and plugin-to-ePDG lifecycle messages.
-	EPDGRequestSocket string
-	// PluginControlSocket is owned by the strongSwan plugin; ePDG connects here
-	// for forced disconnect commands caused by PGW/ePDG-side teardown.
-	PluginControlSocket string
-
-	// Deprecated compatibility fields. Use EPDGRequestSocket and
-	// PluginControlSocket internally after ResolveLegacyAliases runs.
-	Listen        string
-	PluginControl string
 }
 
 type SWMConfig struct {
@@ -93,16 +87,12 @@ type GTPConfig struct {
 	LocalGTPU                 string
 	LocalPort                 int
 	PGWGTPC                   string
-	PGWGTPU                   string
-	Recovery                  int
-	TunName                   string
 	TunAddr                   string
 	MTU                       int
 	ValidateOuterPeer         bool
 	StrictPeerCheck           bool
-	CleanupStaleRoutesOnStart bool
-	UplinkCapture             UplinkCaptureConfig
 	DedicatedBearers          DedicatedBearerConfig
+	BPF                       BPFConfig
 	// MaxSequence caps the GTPv2-C sequence number range. Default 0 means
 	// use the full 24-bit range (0xFFFFFF) per TS 29.274 §6.1.2.
 	// Set to 8388607 (0x7FFFFF) for Cisco StarOS qvpc-si interop — StarOS
@@ -110,21 +100,15 @@ type GTPConfig struct {
 	MaxSequence uint32
 }
 
-type UplinkCaptureConfig struct {
-	Mode                     string
-	QueueNum                 int
-	InstallRules             bool
-	FirewallBackend          string
-	ChainName                string
-	IngressIfName            string
-	QueueBypass              bool
-	FailClosed               bool
-	CleanupStaleRulesOnStart bool
-}
-
 type DedicatedBearerConfig struct {
 	Enabled            bool
 	TFTUplinkSelection bool
+}
+
+type BPFConfig struct {
+	XDPAttachMode string // "generic" | "native" | "offload"
+	XDPInterface  string // NIC receiving UDP/2152 from PGW; auto-derived if empty
+	MapMaxEntries int    // max BPF map entries; default 4096
 }
 
 type APNConfig struct {
@@ -132,28 +116,13 @@ type APNConfig struct {
 }
 
 type PCOConfig struct {
-	Enabled      bool
-	RequestDNS   bool
-	RequestPCSCF bool
-	RequestMTU   bool
-	IncludeAPCO  bool
-	StrictDecode bool
-}
-
-type DatapathConfig struct {
-	EnableIPForwardingCheck    bool
-	InstallRoutes              bool
-	RequirePAAIPsecAlign       bool
-	UplinkPolicyRoutingEnabled bool
-	UplinkTableID              int
-	UplinkTableName            string
-	UplinkPriorityBase         int
-}
-
-type ReauthConfig struct {
-	Mode                   string
-	AllowFallbackNewAttach bool
-	OnFailure              string
+	Enabled        bool
+	RequestDNSv4   bool
+	RequestDNSv6   bool
+	RequestPCSCFv4 bool
+	RequestPCSCFv6 bool
+	IncludeAPCO    bool
+	StrictDecode   bool
 }
 
 type ShutdownConfig struct {
@@ -193,7 +162,6 @@ func Load(path string) (*Config, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-	cfg.ResolveLegacyAliases()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -232,17 +200,6 @@ func setValue(cfg *Config, section, key, value string) error {
 		case "mnc_length":
 			return setInt(value, &cfg.EPDG.MNCLength, section, key)
 		}
-	case "ipc":
-		switch key {
-		case "epdg_request_socket":
-			cfg.IPC.EPDGRequestSocket = value
-		case "plugin_control_socket":
-			cfg.IPC.PluginControlSocket = value
-		case "listen":
-			cfg.IPC.Listen = value
-		case "plugin_control":
-			cfg.IPC.PluginControl = value
-		}
 	case "ikev2":
 		switch key {
 		case "listen_addr":
@@ -255,6 +212,8 @@ func setValue(cfg *Config, section, key, value string) error {
 			cfg.IKEv2.KeyFile = value
 		case "ca_file":
 			cfg.IKEv2.CAFile = value
+		case "dpd_enabled":
+			return setBool(value, &cfg.IKEv2.DPDEnabled, section, key)
 		case "dpd_delay":
 			return setInt(value, &cfg.IKEv2.DPDDelay, section, key)
 		case "dpd_timeout":
@@ -296,50 +255,20 @@ func setValue(cfg *Config, section, key, value string) error {
 			cfg.GTP.LocalGTPC = value
 		case "local_gtpu":
 			cfg.GTP.LocalGTPU = value
-		case "local_addr":
-			cfg.GTP.LocalGTPU = value
 		case "local_port":
 			return setInt(value, &cfg.GTP.LocalPort, section, key)
 		case "pgw_gtpc":
 			cfg.GTP.PGWGTPC = value
-		case "pgw_gtpu":
-			cfg.GTP.PGWGTPU = value
-		case "recovery":
-			return setInt(value, &cfg.GTP.Recovery, section, key)
-		case "tun_name":
-			cfg.GTP.TunName = value
 		case "tun_addr":
 			cfg.GTP.TunAddr = value
 		case "mtu":
 			return setInt(value, &cfg.GTP.MTU, section, key)
-		case "route_table":
-			return setInt(value, &cfg.Datapath.UplinkTableID, section, key)
 		case "validate_outer_peer":
 			return setBool(value, &cfg.GTP.ValidateOuterPeer, section, key)
 		case "strict_peer_check":
 			return setBool(value, &cfg.GTP.StrictPeerCheck, section, key)
-		case "cleanup_stale_routes_on_start":
-			return setBool(value, &cfg.GTP.CleanupStaleRoutesOnStart, section, key)
 		case "max_sequence":
 			return setUint32(value, &cfg.GTP.MaxSequence, section, key)
-		case "uplink_capture_mode":
-			cfg.GTP.UplinkCapture.Mode = value
-		case "nfqueue_queue_num":
-			return setInt(value, &cfg.GTP.UplinkCapture.QueueNum, section, key)
-		case "nfqueue_install_rules":
-			return setBool(value, &cfg.GTP.UplinkCapture.InstallRules, section, key)
-		case "nfqueue_firewall_backend":
-			cfg.GTP.UplinkCapture.FirewallBackend = value
-		case "nfqueue_chain_name":
-			cfg.GTP.UplinkCapture.ChainName = value
-		case "nfqueue_ingress_ifname":
-			cfg.GTP.UplinkCapture.IngressIfName = value
-		case "nfqueue_queue_bypass":
-			return setBool(value, &cfg.GTP.UplinkCapture.QueueBypass, section, key)
-		case "nfqueue_fail_closed":
-			return setBool(value, &cfg.GTP.UplinkCapture.FailClosed, section, key)
-		case "nfqueue_cleanup_stale_rules_on_start":
-			return setBool(value, &cfg.GTP.UplinkCapture.CleanupStaleRulesOnStart, section, key)
 		}
 	case "dedicated_bearers":
 		switch key {
@@ -357,47 +286,39 @@ func setValue(cfg *Config, section, key, value string) error {
 		switch key {
 		case "enabled":
 			return setBool(value, &cfg.PCO.Enabled, section, key)
-		case "request_dns":
-			return setBool(value, &cfg.PCO.RequestDNS, section, key)
-		case "request_pcscf":
-			return setBool(value, &cfg.PCO.RequestPCSCF, section, key)
-		case "request_mtu":
-			return setBool(value, &cfg.PCO.RequestMTU, section, key)
+		case "request_dns_v4":
+			return setBool(value, &cfg.PCO.RequestDNSv4, section, key)
+		case "request_dns_v6":
+			return setBool(value, &cfg.PCO.RequestDNSv6, section, key)
+		case "request_pcscf_v4":
+			return setBool(value, &cfg.PCO.RequestPCSCFv4, section, key)
+		case "request_pcscf_v6":
+			return setBool(value, &cfg.PCO.RequestPCSCFv6, section, key)
 		case "include_apco":
 			return setBool(value, &cfg.PCO.IncludeAPCO, section, key)
 		case "strict_decode":
 			return setBool(value, &cfg.PCO.StrictDecode, section, key)
 		}
-	case "datapath":
+	case "bpf":
 		switch key {
-		case "enable_ip_forwarding_check":
-			return setBool(value, &cfg.Datapath.EnableIPForwardingCheck, section, key)
-		case "install_routes":
-			return setBool(value, &cfg.Datapath.InstallRoutes, section, key)
-		case "require_paa_ipsec_alignment":
-			return setBool(value, &cfg.Datapath.RequirePAAIPsecAlign, section, key)
-		case "uplink_policy_routing_enabled":
-			return setBool(value, &cfg.Datapath.UplinkPolicyRoutingEnabled, section, key)
-		case "uplink_table_id":
-			return setInt(value, &cfg.Datapath.UplinkTableID, section, key)
-		case "uplink_table_name":
-			cfg.Datapath.UplinkTableName = value
-		case "uplink_priority_base":
-			return setInt(value, &cfg.Datapath.UplinkPriorityBase, section, key)
-		}
-	case "reauth":
-		switch key {
-		case "mode":
-			cfg.Reauth.Mode = value
-		case "allow_fallback_new_attach":
-			return setBool(value, &cfg.Reauth.AllowFallbackNewAttach, section, key)
-		case "on_failure":
-			cfg.Reauth.OnFailure = value
+		case "xdp_attach_mode":
+			cfg.GTP.BPF.XDPAttachMode = value
+		case "xdp_interface":
+			cfg.GTP.BPF.XDPInterface = value
+		case "map_max_entries":
+			return setInt(value, &cfg.GTP.BPF.MapMaxEntries, section, key)
 		}
 	case "shutdown":
 		switch key {
 		case "timeout_seconds":
 			return setInt(value, &cfg.Shutdown.TimeoutSeconds, section, key)
+		}
+	case "pgw_discovery":
+		switch key {
+		case "dns_enabled":
+			return setBool(value, &cfg.PGWDiscovery.DNSEnabled, section, key)
+		case "allow_s5s8_fallback":
+			return setBool(value, &cfg.PGWDiscovery.AllowS5S8Fallback, section, key)
 		}
 	default:
 		return fmt.Errorf("unknown config section %q", section)
@@ -411,12 +332,9 @@ func Default() *Config {
 			Level: "info",
 			File:  "/var/log/vectorcore/epdg/epdg.log",
 		},
-		IPC: IPCConfig{
-			EPDGRequestSocket:   "/run/vectorcore/epdg-eap.sock",
-			PluginControlSocket: "/run/vectorcore/strongswan-eap.sock",
-		},
 		IKEv2: IKEv2Config{
 			ListenAddr: "0.0.0.0",
+			DPDEnabled: true,
 			DPDDelay:   30,
 			DPDTimeout: 120,
 		},
@@ -427,78 +345,25 @@ func Default() *Config {
 		},
 		GTP: GTPConfig{
 			LocalPort:         GTPUPort,
-			TunName:           "vc-gtpu0",
 			MTU:               1400,
 			ValidateOuterPeer: true,
 			StrictPeerCheck:   true,
-			UplinkCapture: UplinkCaptureConfig{
-				Mode:            "nfqueue",
-				QueueNum:        4200,
-				InstallRules:    true,
-				FirewallBackend: "iptables",
-				ChainName:       "VECTORCORE-EPDG-UPLINK",
-				FailClosed:      true,
-			},
 			DedicatedBearers: DedicatedBearerConfig{
 				Enabled:            true,
-				TFTUplinkSelection: false,
+				TFTUplinkSelection: true,
+			},
+			BPF: BPFConfig{
+				XDPAttachMode: "generic",
+				MapMaxEntries: 4096,
 			},
 		},
 		PCO: PCOConfig{
 			Enabled: true,
 		},
-		Datapath: DatapathConfig{
-			UplinkPolicyRoutingEnabled: false,
-			UplinkTableID:              4200,
-			UplinkTableName:            "vectorcore-epdg-gtp",
-			UplinkPriorityBase:         10000,
-		},
-		Reauth: ReauthConfig{
-			Mode:                   "preserve_existing_s2b",
-			AllowFallbackNewAttach: false,
-			OnFailure:              "keep_existing_until_ipsec_delete",
-		},
 		Shutdown: ShutdownConfig{
 			TimeoutSeconds: 5,
 		},
 	}
-}
-
-func (c *Config) ResolveLegacyAliases() {
-	if c.IPC.EPDGRequestSocket == "" {
-		c.IPC.EPDGRequestSocket = c.IPC.Listen
-	}
-	if c.IPC.PluginControlSocket == "" {
-		c.IPC.PluginControlSocket = c.IPC.PluginControl
-	}
-}
-
-func (c *Config) LogDeprecatedAliases(log *slog.Logger) {
-	if log == nil {
-		return
-	}
-	logIPCDeprecatedAlias(log, "ipc.listen", "ipc.epdg_request_socket", c.IPC.Listen, c.IPC.EPDGRequestSocket)
-	logIPCDeprecatedAlias(log, "ipc.plugin_control", "ipc.plugin_control_socket", c.IPC.PluginControl, c.IPC.PluginControlSocket)
-}
-
-func logIPCDeprecatedAlias(log *slog.Logger, oldKey, newKey, oldValue, newValue string) {
-	if oldValue == "" {
-		return
-	}
-	if newValue != "" && oldValue != newValue {
-		log.Warn("deprecated IPC config key ignored because new key is set",
-			"old_key", oldKey,
-			"new_key", newKey,
-			"old_value", oldValue,
-			"new_value", newValue,
-		)
-		return
-	}
-	log.Warn("deprecated IPC config key in use",
-		"old_key", oldKey,
-		"new_key", newKey,
-		"value", oldValue,
-	)
 }
 
 func setInt(value string, dst *int, section, key string) error {
@@ -516,15 +381,6 @@ func setUint32(value string, dst *uint32, section, key string) error {
 		return fmt.Errorf("%s.%s must be a non-negative integer: %w", section, key, err)
 	}
 	*dst = uint32(n)
-	return nil
-}
-
-func setUint8(value string, dst *uint8, section, key string) error {
-	n, err := strconv.ParseUint(value, 10, 8)
-	if err != nil {
-		return fmt.Errorf("%s.%s must be a non-negative integer 0-255: %w", section, key, err)
-	}
-	*dst = uint8(n)
 	return nil
 }
 

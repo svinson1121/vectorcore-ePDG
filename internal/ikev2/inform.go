@@ -42,7 +42,7 @@ func (s *Server) handleInformational(conn *net.UDPConn, remote *net.UDPAddr, pkt
 	// Handle UE's response to our DPD probe (no decrypt needed — it's empty).
 	if isUEResponse {
 		sa.mu.Lock()
-		if sa.dpdMsgID != 0 && hdr.MessageID == sa.dpdMsgID {
+		if !sa.dpdSentAt.IsZero() && hdr.MessageID == sa.dpdMsgID {
 			sa.lastSeen = time.Now()
 			sa.dpdSentAt = time.Time{}
 			sa.dpdMsgID = 0
@@ -102,9 +102,65 @@ func (s *Server) handleInformational(conn *net.UDPConn, remote *net.UDPAddr, pkt
 		s.log.Info("INFORMATIONAL: UE requested CHILD SA delete",
 			"imsi", sa.imsi, "spis", deleteESPSPIs, "remote", remote)
 		for _, spi := range deleteESPSPIs {
-			if sa.espProp != nil && (spi == sa.localESPSPI || spi == sa.peerESPSPI) {
-				s.removeXFRMChildSA(sa)
-				break
+			switch {
+			case sa.espProp != nil && (spi == sa.localESPSPI || spi == sa.peerESPSPI):
+				if sa.pendingESPProp != nil {
+					// Rekey in progress: remove only the old SA states; policies remain for the new SA.
+					oldParams := xfrm.ChildSAParams{
+						LocalIP:     sa.localIP,
+						RemoteIP:    sa.remoteAddr.IP,
+						InboundSPI:  sa.localESPSPI,
+						OutboundSPI: sa.peerESPSPI,
+						NATT:        sa.natT,
+						NATTSrcPort: nattPort,
+						NATTDstPort: sa.remoteAddr.Port,
+						IfID:        xfrm.IfID,
+					}
+					if err := xfrm.RemoveChildSAStates(oldParams); err != nil && !errors.Is(err, os.ErrNotExist) {
+						s.log.Warn("INFORMATIONAL: remove old CHILD SA states failed", "err", err, "imsi", sa.imsi)
+					}
+					// Promote the pending SA to current.
+					sa.espProp = sa.pendingESPProp
+					sa.espPropNum = sa.pendingESPPropNum
+					sa.peerESPSPI = sa.pendingPeerESPSPI
+					sa.localESPSPI = sa.pendingLocalESPSPI
+					sa.nonceI = sa.pendingNonceI
+					sa.nonceR = sa.pendingNonceR
+					sa.pendingESPProp = nil
+					sa.pendingESPPropNum = 0
+					sa.pendingPeerESPSPI = 0
+					sa.pendingLocalESPSPI = 0
+					sa.pendingNonceI = nil
+					sa.pendingNonceR = nil
+					s.log.Info("INFORMATIONAL: CHILD SA rekey complete — pending SA promoted",
+						"imsi", sa.imsi, "new_inbound_spi", sa.localESPSPI)
+				} else {
+					// No rekey in progress: full removal (states + policies).
+					s.removeXFRMChildSA(sa)
+				}
+
+			case sa.pendingESPProp != nil && (spi == sa.pendingLocalESPSPI || spi == sa.pendingPeerESPSPI):
+				// UE aborting rekey before completing it — remove the new states, keep the current SA.
+				abortParams := xfrm.ChildSAParams{
+					LocalIP:     sa.localIP,
+					RemoteIP:    sa.remoteAddr.IP,
+					InboundSPI:  sa.pendingLocalESPSPI,
+					OutboundSPI: sa.pendingPeerESPSPI,
+					NATT:        sa.natT,
+					NATTSrcPort: nattPort,
+					NATTDstPort: sa.remoteAddr.Port,
+					IfID:        xfrm.IfID,
+				}
+				if err := xfrm.RemoveChildSAStates(abortParams); err != nil && !errors.Is(err, os.ErrNotExist) {
+					s.log.Warn("INFORMATIONAL: remove pending CHILD SA states failed", "err", err, "imsi", sa.imsi)
+				}
+				sa.pendingESPProp = nil
+				sa.pendingESPPropNum = 0
+				sa.pendingPeerESPSPI = 0
+				sa.pendingLocalESPSPI = 0
+				sa.pendingNonceI = nil
+				sa.pendingNonceR = nil
+				s.log.Info("INFORMATIONAL: CHILD SA rekey aborted by UE", "imsi", sa.imsi)
 			}
 		}
 
@@ -119,6 +175,24 @@ func (s *Server) handleInformational(conn *net.UDPConn, remote *net.UDPAddr, pkt
 // Must be called with sa.mu held.
 func (s *Server) fullTeardown(sa *ikeSA, reason string) {
 	s.removeXFRMChildSA(sa)
+
+	// If a CHILD SA rekey was in progress, also remove the pending SA states.
+	// (Policies were already removed by removeXFRMChildSA above.)
+	if sa.pendingESPProp != nil && sa.localIP != nil {
+		pendingParams := xfrm.ChildSAParams{
+			LocalIP:     sa.localIP,
+			RemoteIP:    sa.remoteAddr.IP,
+			InboundSPI:  sa.pendingLocalESPSPI,
+			OutboundSPI: sa.pendingPeerESPSPI,
+			NATT:        sa.natT,
+			NATTSrcPort: nattPort,
+			NATTDstPort: sa.remoteAddr.Port,
+			IfID:        xfrm.IfID,
+		}
+		if err := xfrm.RemoveChildSAStates(pendingParams); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.log.Warn("fullTeardown: remove pending CHILD SA states failed", "err", err)
+		}
+	}
 
 	handoverComplete := false
 	if s.sessions != nil && sa.sessionID != "" {
@@ -137,6 +211,7 @@ func (s *Server) fullTeardown(sa *ikeSA, reason string) {
 			if s.s2b != nil && sess.S2B != nil && sess.S2B.PGWControlTEID != 0 && sess.S2B.EBI != 0 {
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				if err := s.s2b.DeleteSession(ctx,
+					sess.S2B.PGWControlIP,
 					sess.S2B.PGWControlTEID,
 					sess.S2B.LocalControlTEID,
 					sess.S2B.LocalUserTEID,
@@ -214,6 +289,7 @@ func (s *Server) removeXFRMChildSA(sa *ikeSA) {
 		NATTDstPort:  sa.remoteAddr.Port,
 		LocalTS:      localTS,
 		RemoteTS:     remoteTS,
+		IfID:         xfrm.IfID,
 	}
 	if err := xfrm.RemoveChildSA(params); err != nil && !errors.Is(err, os.ErrNotExist) {
 		s.log.Warn("removeXFRMChildSA: xfrm remove failed", "err", err, "imsi", sa.imsi)
@@ -354,6 +430,7 @@ func (s *Server) migrateMobikeXFRM(sa *ikeSA, newRemote *net.UDPAddr) error {
 		NATTSrcPort:  nattPort,
 		LocalTS:      localTS,
 		RemoteTS:     remoteTS,
+		IfID:         xfrm.IfID,
 	}
 
 	oldParams := base
@@ -371,7 +448,7 @@ func (s *Server) migrateMobikeXFRM(sa *ikeSA, newRemote *net.UDPAddr) error {
 // For SAs idle longer than DPDDelay it sends a DPD probe; for SAs that have not
 // responded to a probe within DPDTimeout it calls fullTeardown.
 func (s *Server) reaperLoop() {
-	if s.fullCfg == nil {
+	if s.fullCfg == nil || !s.fullCfg.IKEv2.DPDEnabled {
 		return
 	}
 	delay := time.Duration(s.fullCfg.IKEv2.DPDDelay) * time.Second
@@ -440,8 +517,8 @@ func (s *Server) reaperLoop() {
 // sendDPDProbe sends an empty INFORMATIONAL request to the UE as a liveness probe.
 // Must be called with sa.mu held. sa.state must be ikeStateEstablished.
 func (s *Server) sendDPDProbe(sa *ikeSA) {
-	sa.ourMsgID++
 	msgID := sa.ourMsgID
+	sa.ourMsgID++
 
 	conn := s.conn500
 	if sa.natT {

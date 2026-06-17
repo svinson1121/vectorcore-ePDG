@@ -6,7 +6,7 @@ epdg:
   mnc_length: 3
 
 logging:
-  level: info
+  level: warn
   file: /var/log/vectorcore/epdg/epdg.log
 
 ikev2:
@@ -15,7 +15,8 @@ ikev2:
   cert_file: config/certs/epdgCert.pem
   key_file:  config/certs/epdgKey.pem
   ca_file:   config/certs/ca.pem
-  dpd_delay: 30     # seconds idle before sending a DPD probe
+  dpd_enabled: true
+  dpd_delay: 30
   dpd_timeout: 120  # seconds to wait for DPD response before tearing down
 
 swm:
@@ -38,26 +39,27 @@ swm:
 
 gtp:
   local_gtpc: 10.90.250.57
-  local_addr: 10.90.250.57
+  local_gtpu: 10.90.250.57
   local_port: 2152
   pgw_gtpc: 10.90.250.92
-  pgw_gtpu: 10.90.250.92
-  recovery: 0
-  tun_name: vc-gtpu0
   mtu: 1400
   validate_outer_peer: true
   strict_peer_check: true
-  cleanup_stale_routes_on_start: true
   max_sequence: 8388607  # Cisco StarOS qvpc-si: rejects bit-23 sequences (StarOS defect).
-  uplink_capture_mode: nfqueue
-  nfqueue_queue_num: 4200
-  nfqueue_install_rules: true
-  nfqueue_firewall_backend: iptables
-  nfqueue_chain_name: VECTORCORE-EPDG-UPLINK
-  nfqueue_ingress_ifname: ""
-  nfqueue_queue_bypass: false
-  nfqueue_fail_closed: true
-  nfqueue_cleanup_stale_rules_on_start: true
+
+pgw_discovery:
+  # dns_enabled: false enables per-attach PGW discovery via DNS S-NAPTR (3GPP TS 29.303).
+  # When false, pgw_gtpc is used directly. Disable for cores without DNS discovery (e.g. Open5GS).
+  dns_enabled: true
+  # allow_s5s8_fallback: when true, fall back to x-s5-gtp/x-s8-gtp NAPTR records if no
+  # x-s2b-gtp record exists. Useful when the MME registered the PGW but the ePDG-specific
+  # service tag is absent (common in deployments where only an MME-facing record is published).
+  allow_s5s8_fallback: true
+
+bpf:
+  xdp_attach_mode: native   # generic works on any NIC; use native for full performance on supported drivers
+  xdp_interface: ens18       # S2b NIC receiving GTP-U from PGW and used for uplink redirect
+  map_max_entries: 20480      # one entry per active UE session
 
 dedicated_bearers:
   enabled: true
@@ -68,24 +70,12 @@ apn:
 
 pco:
   enabled: true
-  request_dns: true
-  request_pcscf: true
-  request_mtu: false
+  request_dns_v4: true
+  request_dns_v6: false
+  request_pcscf_v4: true
+  request_pcscf_v6: false
   include_apco: true
   strict_decode: false
-
-datapath:
-  enable_ip_forwarding_check: true
-  install_routes: false
-  require_paa_ipsec_alignment: true
-  uplink_policy_routing_enabled: false
-  uplink_table_name: vectorcore-epdg-gtp
-  uplink_priority_base: 10000
-
-reauth:
-  mode: preserve_existing_s2b
-  allow_fallback_new_attach: false
-  on_failure: keep_existing_until_ipsec_delete
 
 shutdown:
   timeout_seconds: 5

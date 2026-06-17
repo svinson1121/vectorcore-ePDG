@@ -1,6 +1,9 @@
 package session
 
-import "time"
+import (
+	"net"
+	"time"
+)
 
 type State string
 
@@ -13,7 +16,6 @@ const (
 	StateGTPUInstalling       State = "GTPUInstalling"
 	StateDatapathInstalling   State = "DatapathInstalling"
 	StateActive               State = "Active"
-	StateReauthenticating     State = "Reauthenticating"
 	StateCleaningUp           State = "CleaningUp"
 	StateFailed               State = "Failed"
 	StateDeleted              State = "Deleted"
@@ -39,7 +41,6 @@ type Session struct {
 	S2B          *S2BContext
 	PCO          *PCOState
 	Datapath     *DatapathContext
-	Reauth       *ReauthContext
 	FailureCode  string
 	FailureText  string
 }
@@ -53,7 +54,9 @@ type APNProfile struct {
 type S2BContext struct {
 	PAA              string
 	PGWControlTEID   uint32
+	PGWControlIP     net.IP // from Create Session Response F-TEID IE; used for DeleteSession routing
 	PGWUserTEID      uint32
+	PGWUserIP        net.IP
 	LocalControlTEID uint32
 	LocalUserTEID    uint32
 	EBI              uint8
@@ -62,7 +65,6 @@ type S2BContext struct {
 
 type DatapathContext struct {
 	UEInnerIP              string
-	GTPInterface           string
 	RouteInstalled         bool
 	UplinkRuleInstalled    bool
 	UplinkDefaultInstalled bool
@@ -70,13 +72,6 @@ type DatapathContext struct {
 	RulePriority           int
 	BridgeVerified         bool
 	IPsecPAAAligned        bool
-}
-
-type ReauthContext struct {
-	InProgress        bool
-	IncomingSessionID string
-	OldSessionID      string
-	OldPAA            string
 }
 
 func New(id string) *Session {

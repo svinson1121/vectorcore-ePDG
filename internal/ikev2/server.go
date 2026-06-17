@@ -228,10 +228,6 @@ func (s *Server) deleteSA(spiI uint64) {
 	s.mu.Unlock()
 }
 
-// handleCreateChildSA stub — CHILD SA rekey is Phase 6.
-func (s *Server) handleCreateChildSA(conn *net.UDPConn, remote *net.UDPAddr, pkt []byte, hdr *message.IKEHeader) {
-	s.log.Debug("CREATE_CHILD_SA not yet implemented", "remote", remote)
-}
 
 func mustResolveUDP(addr string) *net.UDPAddr {
 	a, err := net.ResolveUDPAddr("udp4", addr)

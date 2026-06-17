@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"vectorcore-epdg/internal/config"
+	"vectorcore-epdg/internal/cpucaps"
 	"vectorcore-epdg/internal/gtpu"
 	"vectorcore-epdg/internal/ikev2"
 	"vectorcore-epdg/internal/logging"
@@ -74,6 +75,13 @@ func main() {
 		"build_date", buildDate,
 	)
 
+	caps := cpucaps.Detect()
+	kernelAESNI, err := cpucaps.KernelXFRMUsesAESNI()
+	if err != nil {
+		log.Warn("CPU caps: could not verify kernel XFRM AES-NI", "error", err)
+	}
+	caps.Log(log.Logger, kernelAESNI)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -94,7 +102,7 @@ func main() {
 
 	gtpuManager := gtpu.NewManager(*cfg, log.Logger)
 	if err := gtpuManager.Start(ctx); err != nil {
-		log.Error("userspace GTP-U dataplane not ready", "error", err)
+		log.Error("GTP-U dataplane not ready", "error", err)
 		os.Exit(1)
 	}
 
@@ -403,7 +411,7 @@ func cleanupSession(sess *session.Session, gtpuManager *gtpu.Manager, s2bClient 
 	}
 	if sendS2BDelete && sess.S2B != nil && sess.S2B.PGWControlTEID != 0 && sess.S2B.EBI != 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		if err := s2bClient.DeleteSession(ctx, sess.S2B.PGWControlTEID, sess.S2B.LocalControlTEID, sess.S2B.LocalUserTEID, sess.S2B.EBI); err != nil {
+		if err := s2bClient.DeleteSession(ctx, sess.S2B.PGWControlIP, sess.S2B.PGWControlTEID, sess.S2B.LocalControlTEID, sess.S2B.LocalUserTEID, sess.S2B.EBI); err != nil {
 			log.Warn("S2b Delete Session failed", "session_id", sess.ID, "error", err)
 		}
 		cancel()

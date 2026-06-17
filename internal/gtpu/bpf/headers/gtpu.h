@@ -1,0 +1,44 @@
+/* Copyright 2023-2025 Edgecom LLC. Adapted from eUPF (github.com/edgecomllc/eupf), Apache 2.0 */
+#pragma once
+
+#include <linux/types.h>
+#include <linux/unistd.h>
+
+#define GTP_UDP_PORT 2152u
+#define GTP_FLAGS    0x30  /* version=1, PT=1, others=0 */
+
+#define GTPU_ECHO_REQUEST  1
+#define GTPU_ECHO_RESPONSE 2
+#define GTPU_ERROR_INDICATION 26
+#define GTPU_END_MARKER    254
+#define GTPU_G_PDU         255
+
+struct gtpuhdr {
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+    unsigned int pn : 1;
+    unsigned int s  : 1;
+    unsigned int e  : 1;
+    unsigned int spare : 1;
+    unsigned int pt : 1;
+    unsigned int version : 3;
+#elif __BYTE_ORDER == __BIG_ENDIAN
+    unsigned int version : 3;
+    unsigned int pt : 1;
+    unsigned int spare : 1;
+    unsigned int e  : 1;
+    unsigned int s  : 1;
+    unsigned int pn : 1;
+#else
+#error "Please fix <bits/endian.h>"
+#endif
+    __u8  message_type;
+    __u16 message_length;
+    __u32 teid;
+} __attribute__((packed));
+
+/* Optional 4-byte extension word present when any of E, S, PN is set. */
+struct gtp_hdr_ext {
+    __u16 sqn;
+    __u8  npdu;
+    __u8  next_ext;
+} __attribute__((packed));

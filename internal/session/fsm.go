@@ -38,12 +38,6 @@ var allowedTransitions = map[State]map[State]bool{
 		StateFailed:     true,
 	},
 	StateActive: {
-		StateReauthenticating: true,
-		StateCleaningUp:       true,
-		StateFailed:           true,
-	},
-	StateReauthenticating: {
-		StateActive:     true,
 		StateCleaningUp: true,
 		StateFailed:     true,
 	},

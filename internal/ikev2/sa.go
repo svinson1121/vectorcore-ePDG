@@ -82,6 +82,15 @@ type ikeSA struct {
 	localESPSPI uint32 // ePDG's inbound ESP SPI for SAr2
 	cpWantsIP   bool   // UE requested INTERNAL_IP4_ADDRESS via CFG_REQUEST
 
+	// Pending CHILD SA during rekey window (RFC 7296 §2.8): populated after we send
+	// our CREATE_CHILD_SA response, cleared when UE sends DELETE for old or new SPI.
+	pendingESPProp     *childProposal
+	pendingESPPropNum  uint8
+	pendingPeerESPSPI  uint32 // peer's inbound SPI for the new CHILD SA
+	pendingLocalESPSPI uint32 // our inbound SPI for the new CHILD SA
+	pendingNonceI      []byte // initiator nonce from the rekey exchange
+	pendingNonceR      []byte // responder nonce from the rekey exchange
+
 	// IDi payload bytes for AUTH computation: [IDType | 0x00 | 0x00 | 0x00 | IDData].
 	idiAuthBytes []byte
 

@@ -13,13 +13,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
 	"vectorcore-epdg/internal/config"
 	"vectorcore-epdg/internal/session"
+	"vectorcore-epdg/internal/xfrm"
 )
 
 const (
@@ -31,21 +31,21 @@ const (
 	gtpuMsgEchoResp    uint8 = 2
 	gtpuMsgTPDU        uint8 = 255
 
-	tunDevice = "/dev/net/tun"
-	tunSetIFF = 0x400454ca
-	iffTun    = 0x0001
-	iffNoPI   = 0x1000
+	tcTFTFlagRemoteIP   uint8 = 0x01
+	tcTFTFlagProtocol   uint8 = 0x02
+	tcTFTFlagLocalPort  uint8 = 0x04
+	tcTFTFlagRemotePort uint8 = 0x08
+
+	// rtprotEPDG is the Linux route protocol tag used for all PAA host routes
+	// installed by this process. Allows safe flush of stale routes on startup.
+	rtprotEPDG = 100
 )
 
 type Manager struct {
 	cfg config.Config
 	log *slog.Logger
 
-	udp    *net.UDPConn
-	tun    *os.File
-	nfq    *nfqueueConn
-	rawFd  int
-	tunMtu int
+	udp *net.UDPConn
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -54,7 +54,6 @@ type Manager struct {
 	sessionsByID       map[string]*Session
 	sessionsByPAA      map[string]*Session
 	bearersByLocalTEID map[uint32]*BearerRef
-	routesBySessionID  map[string]*routeState
 	stats              DataplaneStats
 	stopOnce           sync.Once
 	loopMu             sync.Mutex
@@ -63,6 +62,9 @@ type Manager struct {
 	pathMu      sync.Mutex
 	pathsByPeer map[string]*pathState
 	echoSeq     uint16
+
+	bpf *BPFDataplane
+	tc  *TCDataplane
 }
 
 type Session struct {
@@ -145,64 +147,31 @@ type BearerRef struct {
 }
 
 type DataplaneStats struct {
-	UplinkPacketsIn                uint64
-	UplinkPacketsGTPUOut           uint64
-	DownlinkGTPUIn                 uint64
-	DownlinkPacketsOut             uint64
-	DroppedNoSession               uint64
-	DroppedNoBearer                uint64
-	DroppedBadTEID                 uint64
-	DroppedBadPeer                 uint64
-	DroppedUnsupported             uint64
-	DroppedMalformed               uint64
-	NFQueuePacketsReceived         uint64
-	NFQueuePacketsEncapsulated     uint64
-	NFQueuePacketsDroppedNoSession uint64
-	NFQueuePacketsDroppedBadPacket uint64
-	NFQueuePacketsDroppedSendError uint64
-	NFQueueVerdictDrop             uint64
-	NFQueueVerdictAccept           uint64
-}
-
-type routeState struct {
-	hostRouteInstalled    bool
-	ruleInstalled         bool
-	defaultRouteInstalled bool
-	rulePriority          int
-	tableID               int
+	DownlinkGTPUIn     uint64
+	DownlinkPacketsOut uint64
+	DroppedBadTEID     uint64
+	DroppedBadPeer     uint64
+	DroppedUnsupported uint64
+	DroppedMalformed   uint64
 }
 
 type rollbackState struct {
 	m                   *Manager
 	sessionID           string
 	paa                 net.IP
-	mainRouteRemoved    bool
-	policyRuleRemoved   bool
-	tableRouteRemoved   bool
-	nfqueueRuleRemoved  bool
 	bearerStateRemoved  bool
 	sessionStateRemoved bool
 	ran                 bool
-	errs                []error
 	actions             []func()
-}
-
-type tunIfReq struct {
-	Name  [unix.IFNAMSIZ]byte
-	Flags uint16
-	_pad  [22]byte
 }
 
 func NewManager(cfg config.Config, log *slog.Logger) *Manager {
 	return &Manager{
 		cfg:                cfg,
 		log:                log,
-		rawFd:              -1,
-		tunMtu:             cfg.GTP.MTU,
 		sessionsByID:       make(map[string]*Session),
 		sessionsByPAA:      make(map[string]*Session),
 		bearersByLocalTEID: make(map[uint32]*BearerRef),
-		routesBySessionID:  make(map[string]*routeState),
 		runningLoops:       make(map[string]bool),
 		pathsByPeer:        make(map[string]*pathState),
 	}
@@ -213,74 +182,50 @@ func (m *Manager) Start(ctx context.Context) error {
 	if localIP == nil {
 		return fmt.Errorf("invalid local GTP-U IP %q", m.cfg.GTP.LocalGTPU)
 	}
-	if m.tunMtu == 0 {
-		m.tunMtu = 1400
-	}
-	m.log.Info("userspace GTP-U dataplane starting",
+	m.log.Info("BPF GTP-U dataplane starting",
 		"local_addr", localIP.String(),
 		"local_port", m.cfg.GTP.LocalPort,
-		"packet_interface", m.cfg.GTP.TunName,
-		"mtu", m.tunMtu,
 	)
-	tun, err := createTUN(m.cfg.GTP.TunName)
+	bpfDP, err := newBPFDataplane(
+		m.cfg.GTP.BPF.XDPInterface,
+		localIP,
+		m.cfg.GTP.BPF.XDPAttachMode,
+		m.cfg.GTP.BPF.MapMaxEntries,
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("BPF downlink XDP: %w", err)
 	}
-	m.tun = tun
-	if err := m.configureTUN(); err != nil {
-		_ = tun.Close()
-		m.tun = nil
-		return err
+	m.bpf = bpfDP
+	m.log.Info("BPF downlink XDP decap attached",
+		"interface", m.cfg.GTP.BPF.XDPInterface,
+		"mode", m.cfg.GTP.BPF.XDPAttachMode,
+	)
+
+	tc, err := newTCDataplane(
+		xfrm.IfName,
+		xfrm.IfID,
+		m.cfg.GTP.BPF.MapMaxEntries,
+	)
+	if err != nil {
+		return fmt.Errorf("TC-BPF uplink: %w", err)
 	}
-	if err := m.detectOrCleanupStaleRoutes(); err != nil {
-		_ = tun.Close()
-		m.tun = nil
-		return err
-	}
-	if err := m.setupNFQueueRules(); err != nil {
-		_ = tun.Close()
-		m.tun = nil
-		return err
-	}
+	m.tc = tc
+	m.log.Info("TC-BPF uplink encap attached", "interface", xfrm.IfName)
+	m.flushOrphanedRoutes()
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: localIP, Port: m.cfg.GTP.LocalPort})
 	if err != nil {
-		_ = tun.Close()
-		m.tun = nil
-		return fmt.Errorf("listen userspace GTP-U UDP %s:%d: %w", localIP.String(), m.cfg.GTP.LocalPort, err)
+		return fmt.Errorf("listen GTP-U UDP control socket %s:%d: %w", localIP.String(), m.cfg.GTP.LocalPort, err)
 	}
 	m.udp = udp
-	m.log.Info("userspace GTP-U UDP socket listening", "addr", udp.LocalAddr().String())
-	nfq, err := openNFQueue(m.cfg.GTP.UplinkCapture.QueueNum, m.log)
-	if err != nil {
-		_ = udp.Close()
-		_ = tun.Close()
-		m.udp = nil
-		m.tun = nil
-		return err
-	}
-	m.nfq = nfq
-	m.log.Info("NFQUEUE uplink capture starting",
-		"queue_num", m.cfg.GTP.UplinkCapture.QueueNum,
-		"fail_closed", m.cfg.GTP.UplinkCapture.FailClosed,
-	)
-	rawFd, err := openRawSocket()
-	if err != nil {
-		_ = nfq.Close()
-		_ = udp.Close()
-		_ = tun.Close()
-		m.nfq = nil
-		m.udp = nil
-		m.tun = nil
-		return fmt.Errorf("open raw IPv4 injection socket: %w", err)
-	}
-	m.rawFd = rawFd
-	m.log.Info("userspace GTP-U raw injection socket ready")
+	m.log.Info("GTP-U UDP control socket listening", "addr", udp.LocalAddr().String())
 	runCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
-	m.wg.Add(3)
-	go m.nfqueueReadLoop(runCtx)
+	goroutines := 2
+	goroutines++ // bpfStatsLoop
+	m.wg.Add(goroutines)
 	go m.udpReadLoop(runCtx)
 	go m.pathEchoLoop(runCtx)
+	go m.bpfStatsLoop(runCtx)
 	return nil
 }
 
@@ -291,45 +236,24 @@ func (m *Manager) Stop() error {
 		if m.cancel != nil {
 			m.cancel()
 		}
-		m.log.Info("NFQUEUE rules cleanup started", "active_rules", m.activeSessionCount())
-		m.cleanupNFQueueRulesForActiveSessions()
-		m.log.Info("NFQUEUE rules cleanup complete")
-		if m.nfq != nil {
-			m.log.Info("NFQUEUE handle closing", "queue_num", m.cfg.GTP.UplinkCapture.QueueNum)
-			errs = append(errs, m.nfq.Close())
-		}
 		if m.udp != nil {
 			m.log.Info("GTP-U UDP socket closing", "addr", m.udp.LocalAddr().String())
 			errs = append(errs, m.udp.Close())
 		}
-		if m.tun != nil {
-			errs = append(errs, m.tun.Close())
+		if m.bpf != nil {
+			errs = append(errs, m.bpf.Close())
+			m.bpf = nil
 		}
-		if m.rawFd >= 0 {
-			errs = append(errs, unix.Close(m.rawFd))
-			m.rawFd = -1
+		if m.tc != nil {
+			errs = append(errs, m.tc.Close())
+			_ = DeleteXfrmIface(xfrm.IfName)
+			m.tc = nil
 		}
 	})
 	m.wg.Wait()
 	m.log.Info("GTP-U dataplane goroutines stopped")
-	m.log.Info("userspace GTP-U dataplane stopped", "packet_interface", m.cfg.GTP.TunName)
+	m.log.Info("BPF GTP-U dataplane stopped")
 	return errors.Join(errs...)
-}
-
-func (m *Manager) cleanupNFQueueRulesForActiveSessions() {
-	var paas []net.IP
-	m.mu.RLock()
-	for _, sess := range m.sessionsByID {
-		if sess.PAA != nil {
-			paas = append(paas, append(net.IP(nil), sess.PAA...))
-		}
-	}
-	m.mu.RUnlock()
-	for _, paa := range paas {
-		if err := m.removeNFQueueRule(paa); err != nil {
-			m.log.Warn("NFQUEUE uplink rule remove failed during stop", "paa", paa.String(), "error", err)
-		}
-	}
 }
 
 func (m *Manager) markLoop(name string, running bool) {
@@ -355,20 +279,19 @@ func (m *Manager) HasBearer(sessionID string, ebi uint8) bool {
 func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 	const (
 		stepValidateInput        = "validate_input"
-		stepInstallNFQueueRule   = "install_nfqueue_rule"
 		stepInstallDefaultBearer = "install_default_bearer"
 		stepFinalizeDatapath     = "finalize_datapath"
 	)
 	if sess == nil || sess.S2B == nil {
-		return fmt.Errorf("%s: userspace GTP-U session requires S2b context", stepValidateInput)
+		return fmt.Errorf("%s: GTP-U session requires S2b context", stepValidateInput)
 	}
 	paa := net.ParseIP(sess.S2B.PAA)
 	if paa == nil || paa.To4() == nil {
-		return fmt.Errorf("%s: userspace GTP-U session requires IPv4 PAA, got %q", stepValidateInput, sess.S2B.PAA)
+		return fmt.Errorf("%s: GTP-U session requires IPv4 PAA, got %q", stepValidateInput, sess.S2B.PAA)
 	}
-	pgw := net.ParseIP(m.cfg.GTP.PGWGTPU)
-	if pgw == nil || pgw.To4() == nil {
-		return fmt.Errorf("%s: invalid PGW GTP-U IP %q", stepValidateInput, m.cfg.GTP.PGWGTPU)
+	pgw := sess.S2B.PGWUserIP.To4()
+	if pgw == nil {
+		return fmt.Errorf("%s: missing PGW GTP-U IP from S2b Create Session Response", stepValidateInput)
 	}
 	local := net.ParseIP(m.cfg.GTP.LocalGTPU)
 	if local == nil || local.To4() == nil {
@@ -394,7 +317,7 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 		LocalControlTEID: sess.S2B.LocalControlTEID,
 		Bearers:          map[uint8]*Bearer{sess.S2B.EBI: b},
 	}
-	m.log.Info("userspace GTP-U session add started",
+	m.log.Info("GTP-U session add started",
 		"session_id", sess.ID,
 		"imsi", sess.IMSI,
 		"apn", sess.APN,
@@ -403,13 +326,11 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 		"local_rx_teid", b.LocalRXTEID,
 		"remote_tx_teid", b.RemoteTXTEID,
 		"pgw_gtpu", pgw.String(),
-		"uplink_capture", m.cfg.GTP.UplinkCapture.Mode,
-		"queue_num", m.cfg.GTP.UplinkCapture.QueueNum,
 	)
 	rb := newRollbackState(m, sess.ID, paa)
 	committed := false
 	fail := func(step string, err error) error {
-		m.log.Error("userspace GTP-U session add failed",
+		m.log.Error("GTP-U session add failed",
 			"session_id", sess.ID,
 			"paa", paa.String(),
 			"step", step,
@@ -424,7 +345,7 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 			rb.run()
 		}
 	}()
-	m.log.Info("userspace GTP-U default bearer install started",
+	m.log.Info("GTP-U default bearer install started",
 		"session_id", sess.ID,
 		"ebi", b.EBI,
 		"local_rx_teid", b.LocalRXTEID,
@@ -440,13 +361,44 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 	m.bearersByLocalTEID[b.LocalRXTEID] = &BearerRef{SessionID: ds.ID, BearerEBI: b.EBI}
 	m.mu.Unlock()
 	rb.add(func() { rb.removeSessionState(sess.ID, paa.String()) })
-	if err := m.installNFQueueRule(sess.ID, paa); err != nil {
-		return fail(stepInstallNFQueueRule, err)
+	if m.bpf != nil {
+		if err := m.bpf.AddTEID(b.LocalRXTEID, paa); err != nil {
+			return fail(stepInstallDefaultBearer, fmt.Errorf("BPF teid_map: %w", err))
+		}
+		teid := b.LocalRXTEID
+		rb.add(func() { _ = m.bpf.RemoveTEID(teid) })
+		if m.tc == nil {
+			// TC uplink not active — route PAA via XDP NIC for policy-based XFRM encrypt.
+			if err := m.addBPFRoute(paa); err != nil {
+				return fail(stepInstallDefaultBearer, fmt.Errorf("BPF PAA route: %w", err))
+			}
+			rb.add(func() { _ = m.removeBPFRoute(paa) })
+		}
 	}
-	rb.add(func() { rb.removeNFQueueRule(paa) })
+	if m.tc != nil {
+		s2bIfname := m.cfg.GTP.BPF.XDPInterface
+		if s2bIfname == "" {
+			return fail(stepInstallDefaultBearer, fmt.Errorf("TC-BPF: xdp_interface must be set for uplink redirect"))
+		}
+		s2bLink, err := netlink.LinkByName(s2bIfname)
+		if err != nil {
+			return fail(stepInstallDefaultBearer, fmt.Errorf("TC-BPF: S2b interface %q: %w", s2bIfname, err))
+		}
+		if err := m.tc.AddUESession(paa, b.RemoteTXTEID, pgw, local, s2bLink.Attrs().Index); err != nil {
+			return fail(stepInstallDefaultBearer, fmt.Errorf("TC-BPF ue_session_map: %w", err))
+		}
+		rb.add(func() { _ = m.tc.RemoveUESession(paa) })
+		if err := m.syncTCBPFTFTRulesLocked(ds); err != nil {
+			return fail(stepInstallDefaultBearer, fmt.Errorf("TC-BPF tft_rule_map: %w", err))
+		}
+		// Route PAA via vc-xfrm0: downlink path is XDP decap → kernel → vc-xfrm0 → XFRM encrypt → UE.
+		if err := m.addBPFRoute(paa); err != nil {
+			return fail(stepInstallDefaultBearer, fmt.Errorf("TC-BPF PAA route: %w", err))
+		}
+		rb.add(func() { _ = m.removeBPFRoute(paa) })
+	}
 	sess.Datapath = &session.DatapathContext{
 		UEInnerIP:              paa.String(),
-		GTPInterface:           m.cfg.GTP.TunName,
 		RouteInstalled:         false,
 		UplinkRuleInstalled:    true,
 		UplinkDefaultInstalled: false,
@@ -457,7 +409,7 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 		return fail(stepFinalizeDatapath, fmt.Errorf("datapath context not set"))
 	}
 	committed = true
-	m.log.Info("userspace GTP-U default bearer installed",
+	m.log.Info("GTP-U default bearer installed",
 		"session_id", sess.ID,
 		"imsi", sess.IMSI,
 		"apn", sess.APN,
@@ -467,7 +419,7 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 		"remote_tx_teid", b.RemoteTXTEID,
 		"pgw_gtpu", pgw.String(),
 	)
-	m.log.Info("userspace GTP-U session add complete",
+	m.log.Info("GTP-U session add complete",
 		"session_id", sess.ID,
 		"paa", paa.String(),
 		"ebi", b.EBI,
@@ -479,42 +431,45 @@ func (m *Manager) RemoveSession(ctx context.Context, sess *session.Session) erro
 	if sess == nil {
 		return nil
 	}
-	var state *routeState
 	var paa net.IP
 	m.mu.Lock()
 	ds := m.sessionsByID[sess.ID]
 	if ds != nil {
 		for ebi, b := range ds.Bearers {
 			delete(m.bearersByLocalTEID, b.LocalRXTEID)
-			m.log.Info("userspace GTP-U bearer removed", "session_id", sess.ID, "ebi", ebi)
+			if m.bpf != nil {
+				_ = m.bpf.RemoveTEID(b.LocalRXTEID)
+			}
+			m.log.Info("GTP-U bearer removed", "session_id", sess.ID, "ebi", ebi)
+		}
+		if ds.PAA != nil {
+			if m.tc != nil {
+				_ = m.tc.RemoveUESession(ds.PAA)
+				_ = m.removeBPFRoute(ds.PAA)
+			} else if m.bpf != nil {
+				_ = m.removeBPFRoute(ds.PAA)
+			}
 		}
 		paa = ds.PAA
 		delete(m.sessionsByPAA, ds.PAA.String())
 		delete(m.sessionsByID, sess.ID)
 	}
-	state = m.routesBySessionID[sess.ID]
-	delete(m.routesBySessionID, sess.ID)
 	m.mu.Unlock()
 	if paa == nil && sess.S2B != nil {
 		paa = net.ParseIP(sess.S2B.PAA)
 	}
-	if paa != nil {
-		if err := m.removeNFQueueRule(paa); err != nil {
-			m.log.Warn("NFQUEUE uplink rule remove failed", "session_id", sess.ID, "paa", paa.String(), "error", err)
-		}
-	}
-	return m.removeRoutes(ctx, sess.ID, paa, state)
+	return nil
 }
 
 func (m *Manager) AddBearer(_ context.Context, sessionID string, b Bearer) error {
 	if b.LocalRXTEID == 0 || b.RemoteTXTEID == 0 || b.EBI == 0 {
-		return fmt.Errorf("userspace GTP-U bearer requires EBI and TEIDs")
+		return fmt.Errorf("GTP-U bearer requires EBI and TEIDs")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ds := m.sessionsByID[sessionID]
 	if ds == nil {
-		return fmt.Errorf("session %q not found for userspace GTP-U bearer", sessionID)
+		return fmt.Errorf("session %q not found for GTP-U bearer", sessionID)
 	}
 	if _, exists := m.bearersByLocalTEID[b.LocalRXTEID]; exists {
 		return fmt.Errorf("local GTP-U RX TEID collision: %d", b.LocalRXTEID)
@@ -528,11 +483,19 @@ func (m *Manager) AddBearer(_ context.Context, sessionID string, b Bearer) error
 	}
 	ds.Bearers[b.EBI] = &b
 	m.bearersByLocalTEID[b.LocalRXTEID] = &BearerRef{SessionID: sessionID, BearerEBI: b.EBI}
+	if m.bpf != nil {
+		if err := m.bpf.AddTEID(b.LocalRXTEID, ds.PAA); err != nil {
+			m.log.Warn("BPF teid_map AddTEID failed for dedicated bearer", "teid", b.LocalRXTEID, "error", err)
+		}
+	}
+	if err := m.syncTCBPFTFTRulesLocked(ds); err != nil {
+		return err
+	}
 	storedTFTCount := 0
 	if ds.Bearers[b.EBI].TFT != nil {
 		storedTFTCount = len(ds.Bearers[b.EBI].TFT.Filters)
 	}
-	m.log.Info("userspace GTP-U dedicated bearer installed", "session_id", sessionID, "ebi", b.EBI, "local_rx_teid", b.LocalRXTEID, "remote_tx_teid", b.RemoteTXTEID, "qci", b.QoS.QCI, "stored_tft_filters", storedTFTCount)
+	m.log.Info("GTP-U dedicated bearer installed", "session_id", sessionID, "ebi", b.EBI, "local_rx_teid", b.LocalRXTEID, "remote_tx_teid", b.RemoteTXTEID, "qci", b.QoS.QCI, "stored_tft_filters", storedTFTCount)
 	return nil
 }
 
@@ -548,57 +511,25 @@ func (m *Manager) RemoveBearer(_ context.Context, sessionID string, ebi uint8) e
 		return nil
 	}
 	delete(m.bearersByLocalTEID, b.LocalRXTEID)
+	if m.bpf != nil {
+		_ = m.bpf.RemoveTEID(b.LocalRXTEID)
+	}
 	delete(ds.Bearers, ebi)
-	m.log.Info("userspace GTP-U bearer removed", "session_id", sessionID, "ebi", ebi)
+	if err := m.syncTCBPFTFTRulesLocked(ds); err != nil {
+		return err
+	}
+	m.log.Info("GTP-U bearer removed", "session_id", sessionID, "ebi", ebi)
 	return nil
 }
 
 func (m *Manager) Stats() DataplaneStats {
 	return DataplaneStats{
-		UplinkPacketsIn:                atomic.LoadUint64(&m.stats.UplinkPacketsIn),
-		UplinkPacketsGTPUOut:           atomic.LoadUint64(&m.stats.UplinkPacketsGTPUOut),
-		DownlinkGTPUIn:                 atomic.LoadUint64(&m.stats.DownlinkGTPUIn),
-		DownlinkPacketsOut:             atomic.LoadUint64(&m.stats.DownlinkPacketsOut),
-		DroppedNoSession:               atomic.LoadUint64(&m.stats.DroppedNoSession),
-		DroppedNoBearer:                atomic.LoadUint64(&m.stats.DroppedNoBearer),
-		DroppedBadTEID:                 atomic.LoadUint64(&m.stats.DroppedBadTEID),
-		DroppedBadPeer:                 atomic.LoadUint64(&m.stats.DroppedBadPeer),
-		DroppedUnsupported:             atomic.LoadUint64(&m.stats.DroppedUnsupported),
-		DroppedMalformed:               atomic.LoadUint64(&m.stats.DroppedMalformed),
-		NFQueuePacketsReceived:         atomic.LoadUint64(&m.stats.NFQueuePacketsReceived),
-		NFQueuePacketsEncapsulated:     atomic.LoadUint64(&m.stats.NFQueuePacketsEncapsulated),
-		NFQueuePacketsDroppedNoSession: atomic.LoadUint64(&m.stats.NFQueuePacketsDroppedNoSession),
-		NFQueuePacketsDroppedBadPacket: atomic.LoadUint64(&m.stats.NFQueuePacketsDroppedBadPacket),
-		NFQueuePacketsDroppedSendError: atomic.LoadUint64(&m.stats.NFQueuePacketsDroppedSendError),
-		NFQueueVerdictDrop:             atomic.LoadUint64(&m.stats.NFQueueVerdictDrop),
-		NFQueueVerdictAccept:           atomic.LoadUint64(&m.stats.NFQueueVerdictAccept),
-	}
-}
-
-func (m *Manager) nfqueueReadLoop(ctx context.Context) {
-	defer m.wg.Done()
-	m.markLoop("nfqueue_read_loop", true)
-	defer m.markLoop("nfqueue_read_loop", false)
-	for {
-		pkt, err := m.nfq.ReadPacket()
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, os.ErrClosed) || errors.Is(err, net.ErrClosed) {
-				m.log.Info("NFQUEUE read loop stopped", "reason", "context_canceled")
-				return
-			}
-			if errors.Is(err, unix.EBADF) || errors.Is(err, unix.EINVAL) {
-				m.log.Info("NFQUEUE read loop stopped", "reason", "handle_closed")
-				return
-			}
-			m.log.Warn("NFQUEUE read failed", "queue_num", m.cfg.GTP.UplinkCapture.QueueNum, "error", err)
-			continue
-		}
-		verdict, reason := m.handleNFQueuePacket(pkt.Payload)
-		if err := m.nfq.SetVerdict(pkt.ID, verdict); err != nil {
-			m.log.Warn("NFQUEUE verdict send failed", "queue_num", m.cfg.GTP.UplinkCapture.QueueNum, "packet_id", pkt.ID, "verdict", verdictName(verdict), "reason", reason, "error", err)
-			continue
-		}
-		m.log.Debug("NFQUEUE verdict sent", "queue_num", m.cfg.GTP.UplinkCapture.QueueNum, "packet_id", pkt.ID, "verdict", verdictName(verdict), "reason", reason)
+		DownlinkGTPUIn:     atomic.LoadUint64(&m.stats.DownlinkGTPUIn),
+		DownlinkPacketsOut: atomic.LoadUint64(&m.stats.DownlinkPacketsOut),
+		DroppedBadTEID:     atomic.LoadUint64(&m.stats.DroppedBadTEID),
+		DroppedBadPeer:     atomic.LoadUint64(&m.stats.DroppedBadPeer),
+		DroppedUnsupported: atomic.LoadUint64(&m.stats.DroppedUnsupported),
+		DroppedMalformed:   atomic.LoadUint64(&m.stats.DroppedMalformed),
 	}
 }
 
@@ -618,109 +549,11 @@ func (m *Manager) udpReadLoop(ctx context.Context) {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
-			m.log.Warn("userspace GTP-U UDP read failed", "error", err)
+			m.log.Warn("GTP-U UDP read failed", "error", err)
 			continue
 		}
 		m.handleDownlink(buf[:n], peer)
 	}
-}
-
-func (m *Manager) handleUplink(pkt []byte) {
-	_, _ = m.encapsulateUplink(pkt, "tun")
-}
-
-func (m *Manager) handleNFQueuePacket(pkt []byte) (uint32, string) {
-	atomic.AddUint64(&m.stats.NFQueuePacketsReceived, 1)
-	verdictOnFailure := nfDrop
-	if !m.cfg.GTP.UplinkCapture.FailClosed {
-		verdictOnFailure = nfAccept
-	}
-	dst := destIP(pkt)
-	src := sourceIP(pkt)
-	proto := ipProto(pkt)
-	m.log.Debug("NFQUEUE packet received",
-		"queue_num", m.cfg.GTP.UplinkCapture.QueueNum,
-		"packet_len", len(pkt),
-		"src", ipLogString(src),
-		"dst", ipLogString(dst),
-		"proto", proto,
-	)
-	ok, reason := m.encapsulateUplink(pkt, "nfqueue")
-	if !ok {
-		switch reason {
-		case "no_session":
-			atomic.AddUint64(&m.stats.NFQueuePacketsDroppedNoSession, 1)
-		case "send_gtpu_failed":
-			atomic.AddUint64(&m.stats.NFQueuePacketsDroppedSendError, 1)
-		default:
-			atomic.AddUint64(&m.stats.NFQueuePacketsDroppedBadPacket, 1)
-		}
-		m.log.Debug("NFQUEUE packet dropped", "reason", reason, "src", ipLogString(src), "dst", ipLogString(dst))
-		if verdictOnFailure == nfAccept {
-			atomic.AddUint64(&m.stats.NFQueueVerdictAccept, 1)
-		} else {
-			atomic.AddUint64(&m.stats.NFQueueVerdictDrop, 1)
-		}
-		return verdictOnFailure, reason
-	}
-	atomic.AddUint64(&m.stats.NFQueuePacketsEncapsulated, 1)
-	atomic.AddUint64(&m.stats.NFQueueVerdictDrop, 1)
-	return nfDrop, "encapsulated"
-}
-
-func (m *Manager) encapsulateUplink(pkt []byte, source string) (bool, string) {
-	atomic.AddUint64(&m.stats.UplinkPacketsIn, 1)
-	src := sourceIP(pkt)
-	if src == nil {
-		atomic.AddUint64(&m.stats.DroppedMalformed, 1)
-		return false, "bad_packet"
-	}
-	dst := destIP(pkt)
-	m.mu.RLock()
-	ds := m.sessionsByPAA[src.String()]
-	var b *Bearer
-	if ds != nil {
-		b = m.selectUplinkBearer(ds, pkt)
-	}
-	m.mu.RUnlock()
-	if ds == nil {
-		atomic.AddUint64(&m.stats.DroppedNoSession, 1)
-		return false, "no_session"
-	}
-	if source == "nfqueue" {
-		m.log.Debug("NFQUEUE session lookup success", "session_id", ds.ID, "paa", src.String())
-	}
-	if b == nil {
-		atomic.AddUint64(&m.stats.DroppedNoBearer, 1)
-		return false, "no_bearer"
-	}
-	if source == "nfqueue" {
-		dedicated := b.EBI != ds.DefaultEBI
-		m.log.Debug("NFQUEUE uplink bearer selected", "session_id", ds.ID, "ebi", b.EBI, "dedicated", dedicated, "remote_tx_teid", b.RemoteTXTEID, "pgw_gtpu", b.PGWGTPUIP.String())
-	}
-	gtp, err := encodeTPDU(b.RemoteTXTEID, pkt)
-	if err != nil {
-		atomic.AddUint64(&m.stats.DroppedMalformed, 1)
-		return false, "bad_packet"
-	}
-	if _, err := m.udp.WriteToUDP(gtp, &net.UDPAddr{IP: b.PGWGTPUIP, Port: config.GTPUPort}); err != nil {
-		m.log.Warn("userspace GTP-U uplink send failed", "session_id", ds.ID, "ebi", b.EBI, "error", err)
-		return false, "send_gtpu_failed"
-	}
-	atomic.AddUint64(&m.stats.UplinkPacketsGTPUOut, 1)
-	atomic.AddUint64(&b.Counters.UplinkPackets, 1)
-	atomic.AddUint64(&b.Counters.UplinkBytes, uint64(len(pkt)))
-	b.Counters.LastUplinkPacket = time.Now()
-	m.log.Debug("userspace GTP-U uplink packet encapsulated",
-		"session_id", ds.ID,
-		"ebi", b.EBI,
-		"teid", b.RemoteTXTEID,
-		"dst", fmt.Sprintf("%s:%d", b.PGWGTPUIP.String(), config.GTPUPort),
-		"inner_src", src.String(),
-		"inner_dst", ipLogString(dst),
-		"bytes", len(pkt),
-	)
-	return true, "encapsulated"
 }
 
 func (m *Manager) handleDownlink(pkt []byte, peer *net.UDPAddr) {
@@ -728,7 +561,7 @@ func (m *Manager) handleDownlink(pkt []byte, peer *net.UDPAddr) {
 	parsed, err := parseGTPU(pkt)
 	if err != nil {
 		atomic.AddUint64(&m.stats.DroppedMalformed, 1)
-		m.log.Debug("userspace GTP-U packet dropped", "reason", "malformed", "peer", peer.String(), "error", err)
+		m.log.Debug("GTP-U packet dropped", "reason", "malformed", "peer", peer.String(), "error", err)
 		return
 	}
 	if parsed.MessageType == gtpuMsgEchoRequest {
@@ -739,139 +572,160 @@ func (m *Manager) handleDownlink(pkt []byte, peer *net.UDPAddr) {
 		m.handleEchoResponse(peer)
 		return
 	}
-	if parsed.MessageType != gtpuMsgTPDU {
+	if parsed.MessageType == gtpuMsgTPDU {
 		atomic.AddUint64(&m.stats.DroppedUnsupported, 1)
-		m.log.Debug("userspace GTP-U packet dropped", "reason", "unsupported_message", "type", parsed.MessageType, "peer", peer.String())
+		m.log.Warn("GTP-U T-PDU reached UDP control socket; XDP downlink datapath should have handled it", "teid", parsed.TEID, "peer", peer.String())
 		return
 	}
-	m.mu.RLock()
-	ref := m.bearersByLocalTEID[parsed.TEID]
-	var ds *Session
-	var b *Bearer
-	if ref != nil {
-		ds = m.sessionsByID[ref.SessionID]
-		if ds != nil {
-			b = ds.Bearers[ref.BearerEBI]
-		}
-	}
-	m.mu.RUnlock()
-	if ds == nil || b == nil {
-		atomic.AddUint64(&m.stats.DroppedBadTEID, 1)
-		m.log.Debug("userspace GTP-U packet dropped", "reason", "unknown_teid", "teid", parsed.TEID, "peer", peer.String())
-		return
-	}
-	if m.cfg.GTP.StrictPeerCheck && !peer.IP.Equal(b.PGWGTPUIP) {
-		atomic.AddUint64(&m.stats.DroppedBadPeer, 1)
-		m.log.Debug("userspace GTP-U packet dropped", "reason", "bad_peer", "session_id", ds.ID, "ebi", b.EBI, "peer", peer.IP.String(), "expected_pgw_gtpu", b.PGWGTPUIP.String())
-		return
-	}
-	m.log.Debug("userspace GTP-U downlink packet decapsulated", "session_id", ds.ID, "ebi", b.EBI, "teid", parsed.TEID, "bytes", len(parsed.Payload))
-	innerSrc := sourceIP(parsed.Payload)
-	innerDst := destIP(parsed.Payload)
-	m.log.Debug("userspace GTP-U downlink inner packet parsed",
-		"session_id", ds.ID,
-		"ebi", b.EBI,
-		"inner_src", ipLogString(innerSrc),
-		"inner_dst", ipLogString(innerDst),
-		"proto", ipProto(parsed.Payload),
-		"bytes", len(parsed.Payload),
-	)
-	if !innerDst.Equal(ds.PAA) {
-		atomic.AddUint64(&m.stats.DroppedBadPeer, 1)
-		m.log.Warn("userspace GTP-U downlink inner destination does not match PAA, dropping",
-			"session_id", ds.ID,
-			"ebi", b.EBI,
-			"inner_dst", ipLogString(innerDst),
-			"paa", ds.PAA.String(),
-		)
-		return
-	}
-	if err := m.injectDownlink(ds, parsed.Payload); err != nil {
-		m.log.Warn("userspace GTP-U downlink packet injection result",
-			"session_id", ds.ID,
-			"result", "error",
-			"error", err,
-		)
-		return
-	}
-	atomic.AddUint64(&m.stats.DownlinkPacketsOut, 1)
-	atomic.AddUint64(&b.Counters.DownlinkPackets, 1)
-	atomic.AddUint64(&b.Counters.DownlinkBytes, uint64(len(parsed.Payload)))
-	b.Counters.LastDownlinkPacket = time.Now()
+	atomic.AddUint64(&m.stats.DroppedUnsupported, 1)
+	m.log.Debug("GTP-U packet dropped", "reason", "unsupported_message", "type", parsed.MessageType, "peer", peer.String())
 }
 
-func (m *Manager) injectDownlink(ds *Session, pkt []byte) error {
-	dst := destIP(pkt)
-	m.log.Debug("userspace GTP-U downlink packet injection started",
-		"session_id", ds.ID,
-		"method", "raw_ip",
-		"inner_dst", ipLogString(dst),
-	)
-	if err := m.injectRawIPv4(pkt); err == nil {
-		m.log.Debug("userspace GTP-U downlink packet injection result",
-			"session_id", ds.ID,
-			"method", "raw_ip",
-			"inner_dst", ipLogString(dst),
-			"result", "success",
-		)
-		return nil
+// xdpStatNames maps BPF dl_stats array index to a human-readable label.
+// Must match enum xdp_stat in xdp_gtpu_decap.c.
+var xdpStatNames = []string{
+	"seen",         // 0: IPv4/UDP reached XDP
+	"cfg_miss",     // 1: dst IP != local GTP-U IP
+	"gtp_port",     // 2: passed UDP/2152 check
+	"gtp_tpdu",     // 3: G-PDU message type confirmed
+	"teid_miss",    // 4: TEID not in map → XDP_PASS
+	"teid_hit",     // 5: TEID found
+	"paa_mismatch", // 6: inner dst != PAA → XDP_DROP
+	"paa_match",    // 7: inner dst == PAA
+	"adjust_fail",  // 8: remove_gtp_header failed
+	"decap_pass",   // 9: XDP_PASS after header strip → kernel routing + XFRM
+}
+
+// bpfStatsLoop periodically reads the BPF per-CPU stats map and logs the
+// aggregate counters so we can see exactly where downlink packets fall off.
+func (m *Manager) bpfStatsLoop(ctx context.Context) {
+	defer m.wg.Done()
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	statsMap := m.bpf.DownlinkStats()
+	nStats := uint32(len(xdpStatNames))
+
+	var prev [10]uint64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			args := make([]any, 0, len(xdpStatNames)*4)
+			changed := false
+			for i := uint32(0); i < nStats; i++ {
+				// PERCPU_ARRAY: value is []uint64, one per CPU.
+				var perCPU []uint64
+				if err := statsMap.Lookup(i, &perCPU); err != nil {
+					continue
+				}
+				var total uint64
+				for _, v := range perCPU {
+					total += v
+				}
+				delta := total - prev[i]
+				prev[i] = total
+				name := xdpStatNames[i]
+				args = append(args, name+"_total", total, name+"_delta", delta)
+				if delta > 0 {
+					changed = true
+				}
+			}
+			if changed {
+				m.log.Info("BPF XDP downlink stats (60s)", args...)
+			}
+		}
+	}
+}
+
+// addBPFRoute adds a host route for the UE's PAA to the S2b NIC so that the
+// inner IP packet XDP_PASS'd after GTP-U decapsulation is forwarded by the
+// kernel and picked up by the XFRM OUT policy (dst=PAA/32) for ESP encryption.
+func (m *Manager) addBPFRoute(paa net.IP) error {
+	ip4 := paa.To4()
+	if ip4 == nil {
+		return fmt.Errorf("addBPFRoute: PAA must be IPv4")
+	}
+	var ifIdx int
+	if m.tc != nil {
+		ifIdx = m.tc.IfaceIndex()
 	} else {
-		m.log.Warn("userspace GTP-U downlink raw injection failed, falling back to TUN",
-			"session_id", ds.ID,
-			"inner_dst", ipLogString(dst),
-			"error", err,
-		)
+		ifIdx = m.bpf.IfaceIndex()
 	}
-	m.log.Debug("userspace GTP-U downlink packet injection started",
-		"session_id", ds.ID,
-		"method", "tun",
-		"inner_dst", ipLogString(dst),
-	)
-	if _, err := m.tun.Write(pkt); err != nil {
-		return fmt.Errorf("tun injection: %w", err)
+	route := &netlink.Route{
+		LinkIndex: ifIdx,
+		Dst:       &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)},
+		Scope:     netlink.SCOPE_LINK,
+		Protocol:  rtprotEPDG,
 	}
-	m.log.Debug("userspace GTP-U downlink packet injection result",
-		"session_id", ds.ID,
-		"method", "tun",
-		"inner_dst", ipLogString(dst),
-		"result", "success",
-	)
+	if err := netlink.RouteAdd(route); err != nil {
+		return fmt.Errorf("addBPFRoute %s/32: %w", ip4, err)
+	}
+	m.log.Info("BPF downlink PAA host route added", "paa", ip4.String())
 	return nil
 }
 
-func (m *Manager) injectRawIPv4(pkt []byte) error {
-	if len(pkt) < 20 || pkt[0]>>4 != 4 {
-		return fmt.Errorf("raw IPv4 injection requires IPv4 packet")
+// removeBPFRoute removes the host route installed by addBPFRoute.
+func (m *Manager) removeBPFRoute(paa net.IP) error {
+	if paa == nil {
+		return nil
 	}
-	dst := destIP(pkt)
-	if dst == nil || dst.To4() == nil {
-		return fmt.Errorf("raw IPv4 injection missing IPv4 destination")
+	ip4 := paa.To4()
+	if ip4 == nil {
+		return nil
 	}
-	ip4 := dst.To4()
-	return unix.Sendto(m.rawFd, pkt, 0, &unix.SockaddrInet4{Addr: [4]byte{ip4[0], ip4[1], ip4[2], ip4[3]}})
+	var ifIdx int
+	if m.tc != nil {
+		ifIdx = m.tc.IfaceIndex()
+	} else {
+		ifIdx = m.bpf.IfaceIndex()
+	}
+	route := &netlink.Route{
+		LinkIndex: ifIdx,
+		Dst:       &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)},
+		Scope:     netlink.SCOPE_LINK,
+		Protocol:  rtprotEPDG,
+	}
+	if err := netlink.RouteDel(route); err != nil {
+		m.log.Warn("BPF downlink PAA host route remove failed", "paa", ip4.String(), "error", err)
+		return err
+	}
+	m.log.Info("BPF downlink PAA host route removed", "paa", ip4.String())
+	return nil
 }
 
-func openRawSocket() (int, error) {
-	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.IPPROTO_RAW)
+// flushOrphanedRoutes removes any PAA /32 host routes left over from a previous
+// run that crashed or was killed before clean shutdown. Routes are identified by
+// rtprotEPDG so only ePDG-installed routes are touched.
+func (m *Manager) flushOrphanedRoutes() {
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4,
+		&netlink.Route{Protocol: rtprotEPDG},
+		netlink.RT_FILTER_PROTOCOL)
 	if err != nil {
-		return -1, fmt.Errorf("open raw IPv4 socket: %w", err)
+		m.log.Warn("startup route flush: list failed", "error", err)
+		return
 	}
-	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_HDRINCL, 1); err != nil {
-		_ = unix.Close(fd)
-		return -1, fmt.Errorf("set IP_HDRINCL on raw socket: %w", err)
+	for _, r := range routes {
+		dst := r.Dst
+		if err := netlink.RouteDel(&r); err != nil {
+			m.log.Warn("startup route flush: delete failed", "dst", dst, "error", err)
+		} else {
+			m.log.Info("startup route flush: removed stale route", "dst", dst)
+		}
 	}
-	return fd, nil
 }
 
 func (m *Manager) respondEcho(seq uint16, peer *net.UDPAddr) {
-	payload := []byte{14, 0, 1, byte(m.cfg.GTP.Recovery)}
+	payload := []byte{14, 0, 1, 0}
 	resp, err := encodePathMessage(gtpuMsgEchoResp, seq, payload)
 	if err != nil {
-		m.log.Warn("userspace GTP-U Echo Response encode failed", "error", err)
+		m.log.Warn("GTP-U Echo Response encode failed", "error", err)
 		return
 	}
 	if _, err := m.udp.WriteToUDP(resp, peer); err != nil {
-		m.log.Warn("userspace GTP-U Echo Response send failed", "peer", peer.String(), "error", err)
+		m.log.Warn("GTP-U Echo Response send failed", "peer", peer.String(), "error", err)
 	}
 }
 
@@ -882,7 +736,11 @@ func ParseTFT(raw []byte) (*TFT, error) {
 	}
 	opCode := raw[0] >> 5
 	numFilters := int(raw[0] & 0x0f)
-	if opCode != 0x01 && opCode != 0x03 && opCode != 0x04 {
+	switch opCode {
+	case 0x01, 0x03, 0x04:
+	case 0x02, 0x05, 0x06:
+		return &TFT{}, nil
+	default:
 		return nil, nil
 	}
 	tft := &TFT{}
@@ -986,78 +844,62 @@ func parsePacketFilterContents(pf *PacketFilter, data []byte) error {
 	return nil
 }
 
-func tcpUDPPorts(pkt []byte) (src, dst uint16, ok bool) {
-	if len(pkt) < 1 || pkt[0]>>4 != 4 {
-		return 0, 0, false
+func (m *Manager) syncTCBPFTFTRulesLocked(ds *Session) error {
+	if m.tc == nil || ds == nil {
+		return nil
 	}
-	if len(pkt) < 20 {
-		return 0, 0, false
+	rules := buildTCBPFTFTRules(ds, m.cfg.GTP.DedicatedBearers.TFTUplinkSelection)
+	if len(rules) > maxTCBPFTFTRules {
+		m.log.Warn("TC-BPF TFT rules truncated", "session_id", ds.ID, "paa", ds.PAA.String(), "rules", len(rules), "max", maxTCBPFTFTRules)
+		rules = rules[:maxTCBPFTFTRules]
 	}
-	ihl := int(pkt[0]&0x0f) * 4
-	proto := pkt[9]
-	if proto != 6 && proto != 17 {
-		return 0, 0, false
+	if err := m.tc.SetTFTRules(ds.PAA, rules); err != nil {
+		return fmt.Errorf("TC-BPF TFT sync for session %q: %w", ds.ID, err)
 	}
-	if len(pkt) < ihl+4 {
-		return 0, 0, false
-	}
-	return binary.BigEndian.Uint16(pkt[ihl : ihl+2]),
-		binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4]),
-		true
+	m.log.Info("TC-BPF TFT rules synced", "session_id", ds.ID, "paa", ds.PAA.String(), "rules", len(rules), "tft_uplink_selection", m.cfg.GTP.DedicatedBearers.TFTUplinkSelection)
+	return nil
 }
 
-func (f *PacketFilter) matchesUplink(pkt []byte) bool {
-	if f.Direction != 0x01 && f.Direction != 0x03 {
-		return false
+func buildTCBPFTFTRules(ds *Session, enabled bool) []TCBPFTFTRule {
+	if !enabled || ds == nil {
+		return nil
 	}
-	if f.RemoteIPv4 != nil {
-		dst := destIP(pkt)
-		if dst == nil {
-			return false
-		}
-		if !dst.To4().Mask(f.RemoteIPv4Mask).Equal(f.RemoteIPv4.Mask(f.RemoteIPv4Mask)) {
-			return false
-		}
-	}
-	if f.HasProtocol && ipProto(pkt) != f.Protocol {
-		return false
-	}
-	srcP, dstP, hasPorts := tcpUDPPorts(pkt)
-	if f.HasLocalPort && (!hasPorts || srcP < f.LocalPortLo || srcP > f.LocalPortHi) {
-		return false
-	}
-	if f.HasRemotePort && (!hasPorts || dstP < f.RemotePortLo || dstP > f.RemotePortHi) {
-		return false
-	}
-	return true
-}
-
-// selectUplinkBearer returns the best bearer for an uplink packet.
-// Must be called with m.mu.RLock held.
-func (m *Manager) selectUplinkBearer(ds *Session, pkt []byte) *Bearer {
-	if !m.cfg.GTP.DedicatedBearers.TFTUplinkSelection {
-		return ds.Bearers[ds.DefaultEBI]
-	}
-	var best *Bearer
-	bestPrecedence := uint8(255)
+	rules := make([]TCBPFTFTRule, 0)
 	for _, b := range ds.Bearers {
-		if b.EBI == ds.DefaultEBI || b.TFT == nil || len(b.TFT.Filters) == 0 {
+		if b == nil || b.EBI == ds.DefaultEBI || b.TFT == nil {
 			continue
 		}
 		for _, f := range b.TFT.Filters {
-			if f.matchesUplink(pkt) {
-				if best == nil || f.Precedence < bestPrecedence {
-					best = b
-					bestPrecedence = f.Precedence
-				}
-				break
+			if f.Direction != 0x01 && f.Direction != 0x03 {
+				continue
 			}
+			rule := TCBPFTFTRule{
+				TEID:         b.RemoteTXTEID,
+				Precedence:   f.Precedence,
+				Protocol:     f.Protocol,
+				LocalPortLo:  f.LocalPortLo,
+				LocalPortHi:  f.LocalPortHi,
+				RemotePortLo: f.RemotePortLo,
+				RemotePortHi: f.RemotePortHi,
+			}
+			if ip4 := f.RemoteIPv4.To4(); ip4 != nil && len(f.RemoteIPv4Mask) == net.IPv4len {
+				rule.Flags |= tcTFTFlagRemoteIP
+				copy(rule.RemoteIP[:], ip4)
+				copy(rule.RemoteMask[:], f.RemoteIPv4Mask)
+			}
+			if f.HasProtocol {
+				rule.Flags |= tcTFTFlagProtocol
+			}
+			if f.HasLocalPort {
+				rule.Flags |= tcTFTFlagLocalPort
+			}
+			if f.HasRemotePort {
+				rule.Flags |= tcTFTFlagRemotePort
+			}
+			rules = append(rules, rule)
 		}
 	}
-	if best != nil {
-		return best
-	}
-	return ds.Bearers[ds.DefaultEBI]
+	return rules
 }
 
 func (m *Manager) UpdateBearer(_ context.Context, sessionID string, ebi, qci uint8, tftRaw []byte) error {
@@ -1086,7 +928,10 @@ func (m *Manager) UpdateBearer(_ context.Context, sessionID string, ebi, qci uin
 	if b.TFT != nil {
 		filterCount = len(b.TFT.Filters)
 	}
-	m.log.Info("userspace GTP-U dedicated bearer updated", "session_id", sessionID, "ebi", ebi, "qci", b.QoS.QCI, "tft_filters", filterCount)
+	if err := m.syncTCBPFTFTRulesLocked(ds); err != nil {
+		return err
+	}
+	m.log.Info("GTP-U dedicated bearer updated", "session_id", sessionID, "ebi", ebi, "qci", b.QoS.QCI, "tft_filters", filterCount)
 	return nil
 }
 
@@ -1145,7 +990,7 @@ func (m *Manager) sendEchoRequest(peer net.IP) {
 	}
 	ps.lastSentAt = time.Now()
 	m.pathMu.Unlock()
-	pkt, err := encodePathMessage(gtpuMsgEchoRequest, seq, []byte{14, 0, 1, byte(m.cfg.GTP.Recovery)})
+	pkt, err := encodePathMessage(gtpuMsgEchoRequest, seq, []byte{14, 0, 1, 0})
 	if err != nil {
 		m.log.Warn("GTP-U path Echo Request encode failed", "peer", peer.String(), "error", err)
 		return
@@ -1176,93 +1021,6 @@ func (m *Manager) handleEchoResponse(peer *net.UDPAddr) {
 	m.log.Debug("GTP-U Echo Response received", "peer", key)
 }
 
-func (m *Manager) configureTUN() error {
-	link, err := netlink.LinkByName(m.cfg.GTP.TunName)
-	if err != nil {
-		return fmt.Errorf("lookup userspace packet interface %q: %w", m.cfg.GTP.TunName, err)
-	}
-	if err := netlink.LinkSetMTU(link, m.tunMtu); err != nil {
-		return fmt.Errorf("set MTU on %s: %w", m.cfg.GTP.TunName, err)
-	}
-	if err := netlink.LinkSetUp(link); err != nil {
-		return fmt.Errorf("bring up %s: %w", m.cfg.GTP.TunName, err)
-	}
-	return nil
-}
-
-func (m *Manager) detectOrCleanupStaleRoutes() error {
-	link, err := netlink.LinkByName(m.cfg.GTP.TunName)
-	if err != nil {
-		return err
-	}
-	routes, err := netlink.RouteList(link, netlink.FAMILY_V4)
-	if err != nil {
-		return fmt.Errorf("list routes for %s: %w", m.cfg.GTP.TunName, err)
-	}
-	for _, route := range routes {
-		if route.Dst == nil || route.Table != unix.RT_TABLE_MAIN {
-			continue
-		}
-		if !m.cfg.GTP.CleanupStaleRoutesOnStart {
-			m.log.Warn("stale userspace GTP-U main PAA route detected",
-				"route", fmt.Sprintf("%s dev %s", route.Dst.String(), m.cfg.GTP.TunName),
-				"cleanup_enabled", false,
-				"cleanup_command", fmt.Sprintf("ip route del %s dev %s", route.Dst.IP.String(), m.cfg.GTP.TunName),
-			)
-			continue
-		}
-		rb := newRollbackState(m, "startup", route.Dst.IP)
-		rb.removeMainRoute(link, route.Dst.IP)
-	}
-	if !m.cfg.Datapath.UplinkPolicyRoutingEnabled {
-		return nil
-	}
-	rules, err := netlink.RuleList(netlink.FAMILY_V4)
-	if err != nil {
-		return fmt.Errorf("list policy rules: %w", err)
-	}
-	for _, rule := range rules {
-		if rule.Table != m.cfg.Datapath.UplinkTableID || rule.Src == nil {
-			continue
-		}
-		if !m.cfg.GTP.CleanupStaleRoutesOnStart {
-			m.log.Warn("stale userspace GTP-U policy rule detected",
-				"from", rule.Src.String(),
-				"table", rule.Table,
-				"priority", rule.Priority,
-				"cleanup_enabled", false,
-				"cleanup_command", fmt.Sprintf("ip rule del from %s lookup %d", rule.Src.String(), rule.Table),
-			)
-			continue
-		}
-		rb := newRollbackState(m, "startup", rule.Src.IP)
-		rb.removePolicyRule(rule.Src.IP, rule.Table, rule.Priority)
-	}
-	tableRoutes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: m.cfg.Datapath.UplinkTableID, LinkIndex: link.Attrs().Index}, netlink.RT_FILTER_TABLE|netlink.RT_FILTER_OIF)
-	if err != nil {
-		return fmt.Errorf("list table %d routes for %s: %w", m.cfg.Datapath.UplinkTableID, m.cfg.GTP.TunName, err)
-	}
-	for _, route := range tableRoutes {
-		if route.Dst != nil && !isDefaultIPv4(route.Dst) {
-			continue
-		}
-		if !m.cfg.GTP.CleanupStaleRoutesOnStart {
-			m.log.Warn("stale userspace GTP-U table default route detected",
-				"table", route.Table,
-				"dev", m.cfg.GTP.TunName,
-				"cleanup_enabled", false,
-				"cleanup_command", fmt.Sprintf("ip route flush table %d", route.Table),
-			)
-			continue
-		}
-	}
-	if m.cfg.GTP.CleanupStaleRoutesOnStart {
-		rb := newRollbackState(m, "startup", nil)
-		rb.removeTableDefaultRoute(link, m.cfg.Datapath.UplinkTableID)
-	}
-	return nil
-}
-
 func newRollbackState(m *Manager, sessionID string, paa net.IP) *rollbackState {
 	return &rollbackState{m: m, sessionID: sessionID, paa: paa}
 }
@@ -1283,13 +1041,9 @@ func (r *rollbackState) run() {
 	if r.paa != nil {
 		paa = r.paa.String()
 	}
-	r.m.log.Info("userspace GTP-U session add rollback complete",
+	r.m.log.Info("GTP-U session add rollback complete",
 		"session_id", r.sessionID,
 		"paa", paa,
-		"removed_main_route", r.mainRouteRemoved,
-		"removed_policy_rule", r.policyRuleRemoved,
-		"removed_table_route", r.tableRouteRemoved,
-		"removed_nfqueue_rule", r.nfqueueRuleRemoved,
 		"removed_bearer_state", r.bearerStateRemoved,
 		"removed_session_state", r.sessionStateRemoved,
 	)
@@ -1314,87 +1068,6 @@ func (r *rollbackState) removeSessionState(sessionID, paa string) {
 			r.sessionStateRemoved = true
 		}
 	}
-	delete(r.m.routesBySessionID, sessionID)
-}
-
-func (r *rollbackState) removeMainRoute(link netlink.Link, paa net.IP) {
-	if paa == nil {
-		return
-	}
-	err := netlink.RouteDel(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: hostNet(paa)})
-	result := "success"
-	if err != nil {
-		if isNotFound(err) {
-			result = "not_found"
-		} else {
-			result = "error"
-		}
-	} else {
-		r.mainRouteRemoved = true
-	}
-	args := []any{"session_id", r.sessionID, "paa", paa.String(), "dev", r.m.cfg.GTP.TunName, "result", result}
-	if err != nil && !isNotFound(err) {
-		args = append(args, "error", err)
-		r.errs = append(r.errs, err)
-	}
-	r.m.log.Info("userspace GTP-U main PAA route removed", args...)
-}
-
-func (r *rollbackState) removePolicyRule(paa net.IP, tableID, priority int) {
-	if paa == nil {
-		return
-	}
-	rule := netlink.NewRule()
-	rule.Src = hostNet(paa)
-	rule.Table = tableID
-	rule.Priority = priority
-	err := netlink.RuleDel(rule)
-	result := "success"
-	if err != nil {
-		if isNotFound(err) {
-			result = "not_found"
-		} else {
-			result = "error"
-		}
-	} else {
-		r.policyRuleRemoved = true
-	}
-	args := []any{"session_id", r.sessionID, "from", hostNet(paa).String(), "table", tableID, "priority", priority, "result", result}
-	if err != nil && !isNotFound(err) {
-		args = append(args, "error", err)
-		r.errs = append(r.errs, err)
-	}
-	r.m.log.Info("userspace GTP-U policy rule removed", args...)
-}
-
-func (r *rollbackState) removeTableDefaultRoute(link netlink.Link, tableID int) {
-	active := r.m.activeSessionCount()
-	if active > 0 {
-		r.m.log.Info("userspace GTP-U table default route removed",
-			"table", tableID,
-			"dev", r.m.cfg.GTP.TunName,
-			"result", "kept_active_sessions",
-			"active_sessions", active,
-		)
-		return
-	}
-	err := netlink.RouteDel(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: defaultIPv4Net(), Table: tableID, Scope: netlink.SCOPE_LINK, Protocol: unix.RTPROT_STATIC})
-	result := "success"
-	if err != nil {
-		if isNotFound(err) {
-			result = "not_found"
-		} else {
-			result = "error"
-		}
-	} else {
-		r.tableRouteRemoved = true
-	}
-	args := []any{"table", tableID, "dev", r.m.cfg.GTP.TunName, "result", result, "active_sessions", active}
-	if err != nil && !isNotFound(err) {
-		args = append(args, "error", err)
-		r.errs = append(r.errs, err)
-	}
-	r.m.log.Info("userspace GTP-U table default route removed", args...)
 }
 
 func (m *Manager) activeSessionCount() int {
@@ -1403,87 +1076,11 @@ func (m *Manager) activeSessionCount() int {
 	return len(m.sessionsByID)
 }
 
-func (m *Manager) removeRoutes(_ context.Context, sessionID string, paa net.IP, state *routeState) error {
-	if !m.cfg.Datapath.InstallRoutes {
-		return nil
-	}
-	if paa == nil {
-		return nil
-	}
-	link, err := netlink.LinkByName(m.cfg.GTP.TunName)
-	if err != nil {
-		return err
-	}
-	if state == nil {
-		state = &routeState{
-			hostRouteInstalled:    true,
-			ruleInstalled:         m.cfg.Datapath.UplinkPolicyRoutingEnabled,
-			defaultRouteInstalled: m.cfg.Datapath.UplinkPolicyRoutingEnabled,
-			tableID:               m.cfg.Datapath.UplinkTableID,
-			rulePriority:          rulePriority(m.cfg.Datapath.UplinkPriorityBase, 0),
-		}
-		if state.rulePriority == m.cfg.Datapath.UplinkPriorityBase {
-			state.rulePriority = rulePriority(m.cfg.Datapath.UplinkPriorityBase, 5)
-		}
-	}
-	rb := newRollbackState(m, sessionID, paa)
-	if state.hostRouteInstalled {
-		rb.removeMainRoute(link, paa)
-	}
-	if state.ruleInstalled {
-		rb.removePolicyRule(paa, state.tableID, state.rulePriority)
-	}
-	if state.defaultRouteInstalled {
-		rb.removeTableDefaultRoute(link, state.tableID)
-	}
-	return errors.Join(rb.errs...)
-}
-
-func createTUN(name string) (*os.File, error) {
-	fd, err := unix.Open(tunDevice, unix.O_RDWR|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", tunDevice, err)
-	}
-	var req tunIfReq
-	copy(req.Name[:], name)
-	req.Flags = iffTun | iffNoPI
-	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(tunSetIFF), uintptr(unsafe.Pointer(&req)))
-	if errno == unix.EBUSY {
-		// Interface held by a previous process (e.g. killed with -9). Delete it and retry once.
-		_ = unix.Close(fd)
-		if link, lerr := netlink.LinkByName(name); lerr == nil {
-			_ = netlink.LinkDel(link)
-		}
-		return createTUN(name)
-	}
-	if errno != 0 {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("create/open TUN interface %q: %w", name, errno)
-	}
-	return os.NewFile(uintptr(fd), name), nil
-}
-
 type gtpuPacket struct {
 	MessageType uint8
 	TEID        uint32
 	Sequence    uint16
 	Payload     []byte
-}
-
-func encodeTPDU(teid uint32, payload []byte) ([]byte, error) {
-	if teid == 0 {
-		return nil, fmt.Errorf("GTP-U T-PDU requires nonzero TEID")
-	}
-	if len(payload) > 0xffff {
-		return nil, fmt.Errorf("GTP-U payload too large: %d", len(payload))
-	}
-	out := make([]byte, 8+len(payload))
-	out[0] = gtpuVersionPT
-	out[1] = gtpuMsgTPDU
-	binary.BigEndian.PutUint16(out[2:4], uint16(len(payload)))
-	binary.BigEndian.PutUint32(out[4:8], teid)
-	copy(out[8:], payload)
-	return out, nil
 }
 
 func encodePathMessage(msgType uint8, seq uint16, payload []byte) ([]byte, error) {
@@ -1540,59 +1137,6 @@ func parseGTPU(b []byte) (gtpuPacket, error) {
 	}
 	p.Payload = append([]byte(nil), b[offset:end]...)
 	return p, nil
-}
-
-func sourceIP(pkt []byte) net.IP {
-	if len(pkt) < 1 {
-		return nil
-	}
-	switch pkt[0] >> 4 {
-	case 4:
-		if len(pkt) < 20 {
-			return nil
-		}
-		return net.IPv4(pkt[12], pkt[13], pkt[14], pkt[15])
-	case 6:
-		if len(pkt) < 40 {
-			return nil
-		}
-		return net.IP(pkt[8:24]).To16()
-	default:
-		return nil
-	}
-}
-
-func hostNet(ip net.IP) *net.IPNet {
-	if ip4 := ip.To4(); ip4 != nil {
-		return &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)}
-	}
-	return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
-}
-
-func defaultIPv4Net() *net.IPNet {
-	return &net.IPNet{IP: net.IPv4(0, 0, 0, 0), Mask: net.IPMask{0, 0, 0, 0}}
-}
-
-func isDefaultIPv4(n *net.IPNet) bool {
-	if n == nil {
-		return true
-	}
-	ones, bits := n.Mask.Size()
-	return bits == 32 && ones == 0 && n.IP.To4() != nil && n.IP.To4().Equal(net.IPv4zero)
-}
-
-func rulePriority(base int, ebi uint8) int {
-	if base <= 0 {
-		base = 10000
-	}
-	return base + int(ebi)
-}
-
-func ignoreNotFound(err error) error {
-	if err == nil || os.IsNotExist(err) {
-		return nil
-	}
-	return err
 }
 
 func isNotFound(err error) bool {

@@ -9,6 +9,7 @@ VectorCore ePDG is a production-grade ePDG implemented as a single self-containe
 | SWu | UE ↔ ePDG IPsec tunnel | RFC 7296 (IKEv2), RFC 4187 (EAP-AKA), RFC 4303 (ESP), RFC 3948 (NAT-T) |
 | SWm | ePDG ↔ AAA EAP-AKA proxy | 3GPP TS 29.273 |
 | S2b | ePDG ↔ PGW PDN session control | 3GPP TS 29.274 |
+| PGW discovery | DNS-based S-NAPTR PGW resolution | 3GPP TS 29.303 |
 | GTP-U | ePDG ↔ PGW user-plane | 3GPP TS 29.281 |
 
 ## Capabilities
@@ -18,9 +19,10 @@ VectorCore ePDG is a production-grade ePDG implemented as a single self-containe
 - Linux XFRM netlink for kernel IPsec SA and policy installation; ESP-in-UDP for NAT traversal
 - **MOBIKE (RFC 4555)** — IKEv2 Mobility: USE_MOBIKE negotiation in IKE_AUTH, COOKIE2 return-routability challenge/verify, XFRM endpoint migration when the UE changes IP address; IPv4 only
 - S2b GTPv2-C: Create/Delete Session, Create/Delete/Update Bearer
-- Userspace GTP-U dataplane over UDP/2152 with Linux TUN interface and nfqueue uplink capture
+- DNS-based PGW discovery (3GPP TS 29.303): per-attach S-NAPTR lookup on the APN-FQDN, preferring `x-3gpp-pgw:x-s2b-gtp` with optional `x-s5-gtp`/`x-s8-gtp` fallback; falls back to static config on DNS failure or when disabled (see `pgw_discovery` in README and `docs/pgw-discovery-fteid-fallback-caveat.md`)
+- BPF GTP-U dataplane over UDP/2152 with Linux TUN/XFRM integration, XDP downlink decap, and TC uplink encap
 - Dedicated bearer support with TFT uplink packet selection
-- PCO/APCO: DNS, P-CSCF IPv4 (RFC 7651 attr 20) and P-CSCF IPv6 (RFC 7651 attr 21), and MTU decoded from S2b and delivered to the UE via IKEv2 CFG_REPLY
+- PCO/APCO: DNS and P-CSCF IPv4 (RFC 7651 attr 20)/IPv6 (RFC 7651 attr 21) decoded from S2b and delivered to the UE via IKEv2 CFG_REPLY
 - Full session lifecycle: IKE SA delete, CHILD SA delete, DPD, PGW-initiated delete, reauthentication
 - **Bidirectional VoWiFi ↔ VoLTE handover** (see `docs/handover.md`):
   - VoWiFi→VoLTE: detects PGW Cause=10 on Delete Bearer; sends SWm STR with Termination-Cause=8 (DIAMETER_USER_MOVED)
