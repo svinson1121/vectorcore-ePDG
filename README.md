@@ -19,6 +19,9 @@ VectorCore ePDG
    AAA / HSS            PGW                   GTP-U dataplane
 ```
 
+
+![Diagram](images/non-3gpp.png)
+
 ## Features
 
 - **Native Go IKEv2** — Full RFC 7296 state machine: IKE_SA_INIT, IKE_AUTH, CHILD SA, DH key exchange, NAT-T, rekey, reauthentication, DPD
