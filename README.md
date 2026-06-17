@@ -436,3 +436,14 @@ The following files are derived works:
 - `internal/gtpu/bpf/headers/parsers.h` — Ethernet/IP/UDP parsers (TCP and PFCP helpers removed)
 - `internal/gtpu/bpf/headers/gtp_utils.h` — GTP parse and header-strip helpers (echo and encap helpers removed)
 - `internal/gtpu/bpf/headers/routing.h` — FIB lookup / IPv4 routing helper (per-CPU stats removed)
+
+### free5GC
+
+vectorcore-ePDG's IKEv2 implementation builds on [free5gc/ike](https://github.com/free5gc/ike),
+the IKEv2 library originally developed for the [free5GC](https://github.com/free5gc) project
+(a Linux Foundation 5G core network project). We're grateful to the free5gc team and
+contributors for their work on a clean, well-tested Go IKEv2 implementation.
+
+- **Project:** [free5gc/ike](https://github.com/free5gc/ike)
+- **License:** Apache License 2.0
+- **Used for:** IKEv2 session establishment and SA negotiation in the ePDG control plane
