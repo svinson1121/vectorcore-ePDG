@@ -5,9 +5,6 @@ connected subscribers, IKE/IPsec state, S2b sessions, GTP-U bearers, and the
 BPF dataplane. It is built with [Huma](https://github.com/danielgtaylor/huma)
 and is disabled by default.
 
-This document covers the API as actually implemented (`internal/api/`). For
-the original design goals, see `docs/api_handoff.md`.
-
 ## Enabling the API
 
 ```yaml
@@ -385,4 +382,3 @@ installation entirely on some 6.x kernels (see `internal/xfrm/xfrm.go`).
 - It runs as its own `http.Server` (`internal/api/server.go`), started and
   stopped alongside the other components (IKEv2, S2b, SWm, GTP-U) from
   `cmd/epdg/main.go`.
-- See `docs/api_handoff.md` for the original design rationale and goals.
