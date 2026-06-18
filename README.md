@@ -359,7 +359,6 @@ The following capabilities are planned for future releases. See `docs/` for deta
 
 | Feature | Notes | Plan |
 |---|---|---|
-| **IPv6 outer tunnel (SWu)** | IKEv2 and IPsec over IPv6 transport — required for UEs on IPv6-only Wi-Fi networks (3GPP TS 24.302 §7.2.2) | `docs/plan-ipv6-ipsec.md` |
 
 ## Supported Algorithms
 
