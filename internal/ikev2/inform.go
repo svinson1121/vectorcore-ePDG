@@ -132,6 +132,12 @@ func (s *Server) handleInformational(conn *net.UDPConn, remote *net.UDPAddr, pkt
 					sa.pendingLocalESPSPI = 0
 					sa.pendingNonceI = nil
 					sa.pendingNonceR = nil
+					if s.sessions != nil && sa.sessionID != "" {
+						if sess := s.sessions.Get(sa.sessionID); sess != nil {
+							sess.ESPInboundSPI = sa.localESPSPI
+							sess.ESPOutboundSPI = sa.peerESPSPI
+						}
+					}
 					s.log.Info("INFORMATIONAL: CHILD SA rekey complete — pending SA promoted",
 						"imsi", sa.imsi, "new_inbound_spi", sa.localESPSPI)
 				} else {
@@ -389,6 +395,11 @@ func (s *Server) handleUpdateSA(conn *net.UDPConn, remote *net.UDPAddr, sa *ikeS
 
 	sa.remoteAddr = remote
 	sa.cookie2 = nil
+	if s.sessions != nil && sa.sessionID != "" {
+		if sess := s.sessions.Get(sa.sessionID); sess != nil {
+			sess.OuterIP = remote.String()
+		}
+	}
 	_ = s.sendEncryptedRaw(conn, remote, sa, message.INFORMATIONAL, msgID, 0, nil, natt)
 	s.log.Info("MOBIKE: path migrated", "imsi", sa.imsi, "old_addr", oldAddr, "new_addr", remote)
 }

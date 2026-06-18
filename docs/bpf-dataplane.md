@@ -34,6 +34,8 @@ bpf:
 |-----|-------------|
 | `xdp_attach_mode` | `generic`, `native`, or `offload` |
 | `xdp_interface` | PGW-facing NIC that receives GTP-U and is used for uplink redirect |
+| `xfrm_if_name` | XFRM virtual interface name; default `vc-xfrm0` |
+| `xfrm_if_id` | XFRM interface ID stamped on IPsec SAs; default `1` |
 | `map_max_entries` | Maximum BPF map entries for sessions and bearers |
 
 ## BPF Programs

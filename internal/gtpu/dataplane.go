@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
@@ -533,6 +534,79 @@ func (m *Manager) Stats() DataplaneStats {
 	}
 }
 
+// SessionSnapshot returns a read-only copy of the GTP-U session state (bearers,
+// TEIDs, per-bearer counters) for the given session ID. Used by the admin API;
+// never returns the live pointer so callers cannot mutate dataplane state.
+func (m *Manager) SessionSnapshot(sessionID string) (Session, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	sess := m.sessionsByID[sessionID]
+	if sess == nil {
+		return Session{}, false
+	}
+	out := *sess
+	out.Bearers = make(map[uint8]*Bearer, len(sess.Bearers))
+	for ebi, b := range sess.Bearers {
+		bCopy := *b
+		out.Bearers[ebi] = &bCopy
+	}
+	return out, true
+}
+
+// XDPCounters returns the aggregate (summed across CPUs) downlink XDP decap
+// counters, keyed by the labels in xdpStatNames. Returns nil if the XDP
+// program isn't attached (e.g. dataplane not started).
+func (m *Manager) XDPCounters() map[string]uint64 {
+	if m.bpf == nil {
+		return nil
+	}
+	return sumPerCPUStats(m.bpf.DownlinkStats(), xdpStatNames)
+}
+
+// TCCounters returns the aggregate uplink TC encap counters, keyed by the
+// labels in ulStatNames. Returns nil if the TC program isn't attached.
+func (m *Manager) TCCounters() map[string]uint64 {
+	if m.tc == nil {
+		return nil
+	}
+	return sumPerCPUStats(m.tc.UplinkStats(), ulStatNames)
+}
+
+// BPFMapOccupancy returns entry counts for the BPF maps that actually exist
+// in this dataplane (teid_map for XDP downlink, ue_session_map for TC uplink).
+func (m *Manager) BPFMapOccupancy() map[string]int {
+	out := make(map[string]int)
+	if m.bpf != nil {
+		if n, err := m.bpf.TEIDMapCount(); err == nil {
+			out["teid_map_entries"] = n
+		}
+	}
+	if m.tc != nil {
+		if n, err := m.tc.UeSessionMapCount(); err == nil {
+			out["ue_session_map_entries"] = n
+		}
+	}
+	return out
+}
+
+// sumPerCPUStats reads a BPF_MAP_TYPE_PERCPU_ARRAY stats map and sums each
+// index across CPUs, labeling the result with names.
+func sumPerCPUStats(statsMap *ebpf.Map, names []string) map[string]uint64 {
+	out := make(map[string]uint64, len(names))
+	for i, name := range names {
+		var perCPU []uint64
+		if err := statsMap.Lookup(uint32(i), &perCPU); err != nil {
+			continue
+		}
+		var total uint64
+		for _, v := range perCPU {
+			total += v
+		}
+		out[name] = total
+	}
+	return out
+}
+
 func (m *Manager) udpReadLoop(ctx context.Context) {
 	defer m.wg.Done()
 	m.markLoop("gtpu_udp_read_loop", true)
@@ -596,6 +670,18 @@ var xdpStatNames = []string{
 	"decap_pass",   // 9: XDP_PASS after header strip → kernel routing + XFRM
 }
 
+// ulStatNames maps TC ul_stats array index to a human-readable label.
+// Must match enum ul_stat in tc_gtpu_encap.c.
+var ulStatNames = []string{
+	"seen",        // 0: IPv4 packets entering the hook
+	"not_ipv4",    // 1: non-IPv4 passed through
+	"ue_miss",     // 2: src IP not in ue_session_map
+	"adjust_fail", // 3: bpf_skb_adjust_room failed
+	"store_fail",  // 4: bpf_skb_store_bytes failed
+	"encap_ok",    // 5: successfully encapsulated
+	"redir_fail",  // 6: bpf_redirect_neigh returned error
+}
+
 // bpfStatsLoop periodically reads the BPF per-CPU stats map and logs the
 // aggregate counters so we can see exactly where downlink packets fall off.
 func (m *Manager) bpfStatsLoop(ctx context.Context) {
@@ -603,31 +689,20 @@ func (m *Manager) bpfStatsLoop(ctx context.Context) {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
-	statsMap := m.bpf.DownlinkStats()
-	nStats := uint32(len(xdpStatNames))
-
-	var prev [10]uint64
+	prev := make(map[string]uint64, len(xdpStatNames))
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			args := make([]any, 0, len(xdpStatNames)*4)
+			counters := m.XDPCounters()
+			args := make([]any, 0, len(counters)*4)
 			changed := false
-			for i := uint32(0); i < nStats; i++ {
-				// PERCPU_ARRAY: value is []uint64, one per CPU.
-				var perCPU []uint64
-				if err := statsMap.Lookup(i, &perCPU); err != nil {
-					continue
-				}
-				var total uint64
-				for _, v := range perCPU {
-					total += v
-				}
-				delta := total - prev[i]
-				prev[i] = total
-				name := xdpStatNames[i]
+			for _, name := range xdpStatNames {
+				total := counters[name]
+				delta := total - prev[name]
+				prev[name] = total
 				args = append(args, name+"_total", total, name+"_delta", delta)
 				if delta > 0 {
 					changed = true
@@ -1074,6 +1149,12 @@ func (m *Manager) activeSessionCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.sessionsByID)
+}
+
+// ActiveSessionCount returns the number of GTP-U sessions currently installed.
+// Exported for the admin API.
+func (m *Manager) ActiveSessionCount() int {
+	return m.activeSessionCount()
 }
 
 type gtpuPacket struct {

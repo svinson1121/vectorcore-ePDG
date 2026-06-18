@@ -270,7 +270,6 @@ func (s *Server) deleteSA(spiI uint64) {
 	s.mu.Unlock()
 }
 
-
 func mustResolveUDP(network, addr string) *net.UDPAddr {
 	a, err := net.ResolveUDPAddr(network, addr)
 	if err != nil {

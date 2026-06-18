@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"vectorcore-epdg/internal/api"
 	"vectorcore-epdg/internal/config"
 	"vectorcore-epdg/internal/cpucaps"
 	"vectorcore-epdg/internal/gtpu"
@@ -25,7 +26,6 @@ import (
 
 var (
 	version   = "dev"
-	commit    = "unknown"
 	buildDate = "unknown"
 )
 
@@ -71,7 +71,6 @@ func main() {
 		"mcc", cfg.EPDG.MCC,
 		"mnc", cfg.EPDG.MNC,
 		"version", version,
-		"commit", commit,
 		"build_date", buildDate,
 	)
 
@@ -148,6 +147,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	var apiSrv *api.Server
+	if cfg.API.Enabled {
+		apiSrv = api.NewServer(cfg.API, manager, gtpuManager, api.BuildInfo{
+			Version:   version,
+			BuildDate: buildDate,
+		}, log.Logger)
+		if err := apiSrv.Start(ctx); err != nil {
+			log.Error("admin API failed to start", "error", err)
+			os.Exit(1)
+		}
+		log.Info("admin API listening", "addr", fmt.Sprintf("%s:%d", cfg.API.ListenAddress, cfg.API.ListenPort))
+	}
+
 	log.Info("VectorCore ePDG ready",
 		"ikev2_listen", cfg.IKEv2.ListenAddr,
 		"swm_peer", fmt.Sprintf("%s:%d", cfg.SWM.PeerAddr, cfg.SWM.PeerPort),
@@ -160,6 +172,12 @@ func main() {
 	log.Info("VectorCore ePDG shutdown", "timeout", shutdownTimeout)
 
 	ikeSrv.Close()
+
+	if apiSrv != nil {
+		waitComponent(log.Logger, "admin_api", shutdownTimeout, func() error {
+			return apiSrv.Stop()
+		})
+	}
 
 	waitComponent(log.Logger, "gtpu_dataplane", shutdownTimeout, func() error {
 		return gtpuManager.Stop()

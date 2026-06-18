@@ -95,6 +95,11 @@ func (d *TCDataplane) UplinkStats() *ebpf.Map {
 	return d.objs.UlStats
 }
 
+// UeSessionMapCount returns the number of entries currently in ue_session_map.
+func (d *TCDataplane) UeSessionMapCount() (int, error) {
+	return countMapEntries[GtpuEncapIpv4Key, GtpuEncapUeSessionEntry](d.objs.UeSessionMap)
+}
+
 // AddUESession inserts or updates a UE session entry in ue_session_map.
 // paa is the UE's inner IPv4 address (key, network byte order).
 // ulTEID is the uplink TEID in host byte order.

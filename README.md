@@ -37,6 +37,7 @@ VectorCore ePDG
 - **Lifecycle management** — IKE SA delete, CHILD SA delete, DPD, PGW-initiated delete; full teardown of XFRM + GTP-U + S2b state
 - **Reauthentication** — A new IKE_AUTH from an already-attached IMSI+APN (without a handover indication) is treated as an implicit detach of the existing session followed by a fresh PDN attach, per 3GPP TS 23.402
 - **Dual-stack SWu (IPv4 + IPv6 outer tunnel)** — IKEv2 and IPsec/ESP over IPv6 transport in addition to IPv4, opt-in via `ikev2.listen_addr_v6` (3GPP TS 24.302 §7.2.2); the inner PDN connection (PAA, S2b, GTP-U) remains IPv4-only
+- **Read-only administrative API** — Huma-based HTTP API (`/api/v1`) for connected subscribers, IKE/IPsec/S2b session detail, and BPF dataplane statistics; OpenAPI spec and Swagger UI at `/docs`. Disabled by default; see [docs/API.md](docs/API.md)
 - **3GPP compliant** — Implements TS 23.402, TS 24.302, TS 29.273, TS 29.274, TS 29.303, TS 33.402
 
 
@@ -352,6 +353,28 @@ bpf:
 ```
 
 See `docs/bpf-dataplane.md` for dataplane details.
+
+### `api` — Administrative API
+
+Read-only HTTP API for operational visibility into subscribers, sessions,
+and dataplane statistics. Disabled by default — no authentication, so bind
+it to a trusted address if enabled.
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Start the admin API listener |
+| `listen_address` | `0.0.0.0` | Bind address |
+| `listen_port` | `8080` | Bind port |
+
+Example:
+```yaml
+api:
+  enabled: true
+  listen_address: "127.0.0.1"
+  listen_port: 8080
+```
+
+See `docs/API.md` for the full endpoint reference and usage examples.
 
 ## Planned Features
 

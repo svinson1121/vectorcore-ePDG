@@ -535,6 +535,9 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 
 		if s.sessions != nil {
 			if sess := s.sessions.Get(sa.sessionID); sess != nil {
+				sess.ESPInboundSPI = sa.localESPSPI
+				sess.ESPOutboundSPI = sa.peerESPSPI
+				sess.OuterIP = sa.remoteAddr.String()
 				_ = sess.Transition(session.StateGTPUInstalling)
 			}
 		}

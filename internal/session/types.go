@@ -22,27 +22,28 @@ const (
 )
 
 type Session struct {
-	ID           string
-	IMSI         string
-	NAI          string
-	APN          string
-	IkeSPII      uint64
-	IkeSPIR      uint64
-	ChildSPII    uint64
-	ChildSPIR    uint64
+	ID               string
+	IMSI             string
+	NAI              string
+	APN              string
+	IkeSPII          uint64
+	IkeSPIR          uint64
+	OuterIP          string // UE's NAT'd outer IP:port, set at IKE_SA_INIT / MOBIKE update
+	ESPInboundSPI    uint32 // ePDG's inbound ESP SPI
+	ESPOutboundSPI   uint32 // peer's inbound ESP SPI (our outbound SPI)
 	SWMSessionID     string
 	HandoverComplete bool
 	State            State
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	EAPPayload   []byte
-	MSK          []byte
-	APNProfile   *APNProfile
-	S2B          *S2BContext
-	PCO          *PCOState
-	Datapath     *DatapathContext
-	FailureCode  string
-	FailureText  string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	EAPPayload       []byte
+	MSK              []byte
+	APNProfile       *APNProfile
+	S2B              *S2BContext
+	PCO              *PCOState
+	Datapath         *DatapathContext
+	FailureCode      string
+	FailureText      string
 }
 
 type APNProfile struct {

@@ -25,6 +25,13 @@ type Config struct {
 	PCO          PCOConfig
 	Shutdown     ShutdownConfig
 	PGWDiscovery PGWDiscoveryConfig
+	API          APIConfig
+}
+
+type APIConfig struct {
+	Enabled       bool
+	ListenAddress string
+	ListenPort    int
 }
 
 type PGWDiscoveryConfig struct {
@@ -87,16 +94,16 @@ type SWMConfig struct {
 }
 
 type GTPConfig struct {
-	LocalGTPC                 string
-	LocalGTPU                 string
-	LocalPort                 int
-	PGWGTPC                   string
-	TunAddr                   string
-	MTU                       int
-	ValidateOuterPeer         bool
-	StrictPeerCheck           bool
-	DedicatedBearers          DedicatedBearerConfig
-	BPF                       BPFConfig
+	LocalGTPC         string
+	LocalGTPU         string
+	LocalPort         int
+	PGWGTPC           string
+	TunAddr           string
+	MTU               int
+	ValidateOuterPeer bool
+	StrictPeerCheck   bool
+	DedicatedBearers  DedicatedBearerConfig
+	BPF               BPFConfig
 	// MaxSequence caps the GTPv2-C sequence number range. Default 0 means
 	// use the full 24-bit range (0xFFFFFF) per TS 29.274 §6.1.2.
 	// Set to 8388607 (0x7FFFFF) for Cisco StarOS qvpc-si interop — StarOS
@@ -326,6 +333,15 @@ func setValue(cfg *Config, section, key, value string) error {
 		case "allow_s5s8_fallback":
 			return setBool(value, &cfg.PGWDiscovery.AllowS5S8Fallback, section, key)
 		}
+	case "api":
+		switch key {
+		case "enabled":
+			return setBool(value, &cfg.API.Enabled, section, key)
+		case "listen_address":
+			cfg.API.ListenAddress = value
+		case "listen_port":
+			return setInt(value, &cfg.API.ListenPort, section, key)
+		}
 	default:
 		return fmt.Errorf("unknown config section %q", section)
 	}
@@ -368,6 +384,11 @@ func Default() *Config {
 		},
 		Shutdown: ShutdownConfig{
 			TimeoutSeconds: 5,
+		},
+		API: APIConfig{
+			Enabled:       false,
+			ListenAddress: "0.0.0.0",
+			ListenPort:    8080,
 		},
 	}
 }

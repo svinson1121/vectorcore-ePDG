@@ -123,6 +123,27 @@ func (d *BPFDataplane) DownlinkStats() *ebpf.Map {
 	return d.objs.DlStats
 }
 
+// TEIDMapCount returns the number of entries currently in teid_map.
+func (d *BPFDataplane) TEIDMapCount() (int, error) {
+	return countMapEntries[uint32, GtpuDecapTeidEntry](d.objs.TeidMap)
+}
+
+// countMapEntries iterates m and counts its keys. Used for read-only
+// occupancy reporting; not on any packet-processing hot path.
+func countMapEntries[K, V any](m *ebpf.Map) (int, error) {
+	var key K
+	var val V
+	count := 0
+	it := m.Iterate()
+	for it.Next(&key, &val) {
+		count++
+	}
+	if err := it.Err(); err != nil {
+		return 0, fmt.Errorf("bpf: iterate map: %w", err)
+	}
+	return count, nil
+}
+
 // Close detaches the XDP program and releases all kernel BPF resources.
 func (d *BPFDataplane) Close() error {
 	var first error

@@ -63,6 +63,11 @@ func (c *Config) Validate() error {
 	}
 	require(&errs, c.GTP.BPF.XDPInterface, "bpf.xdp_interface")
 
+	if c.API.Enabled {
+		requireIP(&errs, c.API.ListenAddress, "api.listen_address")
+		requirePort(&errs, c.API.ListenPort, "api.listen_port")
+	}
+
 	return errors.Join(errs...)
 }
 

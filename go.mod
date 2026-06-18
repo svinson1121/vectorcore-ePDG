@@ -4,6 +4,7 @@ go 1.26.2
 
 require (
 	github.com/cilium/ebpf v0.21.0
+	github.com/danielgtaylor/huma/v2 v2.38.0
 	github.com/free5gc/ike v1.2.1
 	github.com/ishidawataru/sctp v0.0.0-20251114114122-19ddcbc6aae2
 	github.com/miekg/dns v1.1.72
@@ -16,7 +17,7 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	golang.org/x/mod v0.31.0 // indirect
-	golang.org/x/net v0.48.0 // indirect
+	golang.org/x/net v0.53.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/tools v0.40.0 // indirect
 )

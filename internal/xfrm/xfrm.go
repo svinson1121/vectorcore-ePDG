@@ -6,6 +6,7 @@ package xfrm
 import (
 	"fmt"
 	"net"
+	"sync"
 
 	"github.com/vishvananda/netlink"
 )
@@ -64,8 +65,10 @@ func InstallChildSA(p ChildSAParams) error {
 	if err := netlink.XfrmStateAdd(inbound); err != nil {
 		return fmt.Errorf("xfrm: add inbound SA (spi=%08x): %w", p.InboundSPI, err)
 	}
+	markInbound(p.InboundSPI)
 	if err := netlink.XfrmStateAdd(outbound); err != nil {
 		_ = netlink.XfrmStateDel(inbound)
+		unmarkInbound(p.InboundSPI)
 		return fmt.Errorf("xfrm: add outbound SA (spi=%08x): %w", p.OutboundSPI, err)
 	}
 
@@ -74,12 +77,14 @@ func InstallChildSA(p ChildSAParams) error {
 	if err := netlink.XfrmPolicyAdd(inPol); err != nil {
 		_ = netlink.XfrmStateDel(inbound)
 		_ = netlink.XfrmStateDel(outbound)
+		unmarkInbound(p.InboundSPI)
 		return fmt.Errorf("xfrm: add inbound policy: %w", err)
 	}
 	if err := netlink.XfrmPolicyAdd(fwdPol); err != nil {
 		_ = netlink.XfrmPolicyDel(inPol)
 		_ = netlink.XfrmStateDel(inbound)
 		_ = netlink.XfrmStateDel(outbound)
+		unmarkInbound(p.InboundSPI)
 		return fmt.Errorf("xfrm: add uplink forward policy: %w", err)
 	}
 	if err := netlink.XfrmPolicyAdd(outPol); err != nil {
@@ -87,9 +92,63 @@ func InstallChildSA(p ChildSAParams) error {
 		_ = netlink.XfrmPolicyDel(inPol)
 		_ = netlink.XfrmStateDel(inbound)
 		_ = netlink.XfrmStateDel(outbound)
+		unmarkInbound(p.InboundSPI)
 		return fmt.Errorf("xfrm: add outbound policy: %w", err)
 	}
 	return nil
+}
+
+// ESPStats aggregates kernel ESP SA counters across all CHILD SAs this ePDG
+// has installed (identified by Ifid == IfID). Read-only; used by the admin API.
+type ESPStats struct {
+	ActiveStates int // count of inbound+outbound XFRM states (2 per CHILD SA)
+	BytesIn      uint64
+	BytesOut     uint64
+	PacketsIn    uint64
+	PacketsOut   uint64
+}
+
+// inboundSPIs tracks which SPIs we installed as inbound, so Stats() can split
+// kernel-reported counters by direction. We do our own bookkeeping rather than
+// the kernel's XFRMA_SA_DIR attribute: that attribute's netlink number depends
+// on the exact kernel build (some 6.x kernels don't have it, where it instead
+// aliases XFRMA_SA_PCPU and gets rejected with -ERANGE on a u8/u32 size mismatch).
+var (
+	inboundSPIsMu sync.Mutex
+	inboundSPIs   = make(map[uint32]struct{})
+)
+
+func markInbound(spi uint32)   { inboundSPIsMu.Lock(); inboundSPIs[spi] = struct{}{}; inboundSPIsMu.Unlock() }
+func unmarkInbound(spi uint32) { inboundSPIsMu.Lock(); delete(inboundSPIs, spi); inboundSPIsMu.Unlock() }
+func isInbound(spi uint32) bool {
+	inboundSPIsMu.Lock()
+	defer inboundSPIsMu.Unlock()
+	_, ok := inboundSPIs[spi]
+	return ok
+}
+
+// Stats reads all kernel ESP XFRM states tagged with our Ifid and aggregates
+// their packet/byte counters, split by direction via our own inboundSPIs set.
+func Stats() (ESPStats, error) {
+	states, err := netlink.XfrmStateList(netlink.FAMILY_ALL)
+	if err != nil {
+		return ESPStats{}, fmt.Errorf("xfrm: list states: %w", err)
+	}
+	var out ESPStats
+	for _, st := range states {
+		if st.Proto != netlink.XFRM_PROTO_ESP || st.Ifid != int(IfID) {
+			continue
+		}
+		out.ActiveStates++
+		if isInbound(uint32(st.Spi)) {
+			out.BytesIn += st.Statistics.Bytes
+			out.PacketsIn += st.Statistics.Packets
+		} else {
+			out.BytesOut += st.Statistics.Bytes
+			out.PacketsOut += st.Statistics.Packets
+		}
+	}
+	return out, nil
 }
 
 // FlushAll removes all ESP XFRM states and policies from the kernel.
@@ -126,6 +185,7 @@ func RemoveChildSA(p ChildSAParams) error {
 	save(netlink.XfrmPolicyDel(inPol))
 	save(netlink.XfrmStateDel(outbound))
 	save(netlink.XfrmStateDel(inbound))
+	unmarkInbound(p.InboundSPI)
 	return firstErr
 }
 
@@ -243,8 +303,10 @@ func AddChildSAStates(p ChildSAParams) error {
 	if err := netlink.XfrmStateAdd(inbound); err != nil {
 		return fmt.Errorf("xfrm: add inbound SA (spi=%08x): %w", p.InboundSPI, err)
 	}
+	markInbound(p.InboundSPI)
 	if err := netlink.XfrmStateAdd(outbound); err != nil {
 		_ = netlink.XfrmStateDel(inbound)
+		unmarkInbound(p.InboundSPI)
 		return fmt.Errorf("xfrm: add outbound SA (spi=%08x): %w", p.OutboundSPI, err)
 	}
 	return nil
@@ -282,6 +344,7 @@ func RemoveChildSAStates(p ChildSAParams) error {
 	}
 	save(netlink.XfrmStateDel(outbound))
 	save(netlink.XfrmStateDel(inbound))
+	unmarkInbound(p.InboundSPI)
 	return firstErr
 }
 
