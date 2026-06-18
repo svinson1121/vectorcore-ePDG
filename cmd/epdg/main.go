@@ -132,7 +132,8 @@ func main() {
 	})
 
 	ikeSrv := ikev2.NewServer(&ikev2.Config{
-		ListenAddr: cfg.IKEv2.ListenAddr,
+		ListenAddr:   cfg.IKEv2.ListenAddr,
+		ListenAddrV6: cfg.IKEv2.ListenAddrV6,
 	}, log.Logger)
 	if err := ikeSrv.SetFullConfig(cfg); err != nil {
 		log.Error("IKEv2: cert configuration error", "error", err)

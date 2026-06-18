@@ -41,6 +41,9 @@ type Server struct {
 	conn500  *net.UDPConn
 	conn4500 *net.UDPConn
 
+	conn500v6  *net.UDPConn // IKEv2 port 500, IPv6 (nil unless ListenAddrV6 is set)
+	conn4500v6 *net.UDPConn // NAT-T port 4500, IPv6 (nil unless ListenAddrV6 is set)
+
 	// Dependencies injected via Set* after construction.
 	swm      *swm.Client
 	sessions *session.Manager
@@ -57,9 +60,10 @@ type Server struct {
 
 // Config holds IKEv2 server configuration.
 type Config struct {
-	ListenAddr string // e.g. "0.0.0.0"
-	IKEPort    int    // 0 → 500
-	NATTPort   int    // 0 → 4500
+	ListenAddr   string // e.g. "0.0.0.0"
+	ListenAddrV6 string // e.g. "::"; empty = IPv6 disabled
+	IKEPort      int    // 0 → 500
+	NATTPort     int    // 0 → 4500
 }
 
 func NewServer(cfg *Config, log *slog.Logger) *Server {
@@ -112,11 +116,11 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	addr4500 := fmt.Sprintf("%s:%d", s.cfg.ListenAddr, nattP)
 
 	var err error
-	s.conn500, err = net.ListenUDP("udp4", mustResolveUDP(addr500))
+	s.conn500, err = net.ListenUDP("udp4", mustResolveUDP("udp4", addr500))
 	if err != nil {
 		return fmt.Errorf("ikev2: listen %s: %w", addr500, err)
 	}
-	s.conn4500, err = net.ListenUDP("udp4", mustResolveUDP(addr4500))
+	s.conn4500, err = net.ListenUDP("udp4", mustResolveUDP("udp4", addr4500))
 	if err != nil {
 		s.conn500.Close()
 		return fmt.Errorf("ikev2: listen %s: %w", addr4500, err)
@@ -131,6 +135,38 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 	go s.readLoop(s.conn500, false)
 	go s.readLoop(s.conn4500, true)
+
+	if s.cfg.ListenAddrV6 != "" {
+		addr500v6 := fmt.Sprintf("[%s]:%d", s.cfg.ListenAddrV6, ikeP)
+		addr4500v6 := fmt.Sprintf("[%s]:%d", s.cfg.ListenAddrV6, nattP)
+
+		s.conn500v6, err = net.ListenUDP("udp6", mustResolveUDP("udp6", addr500v6))
+		if err != nil {
+			s.conn500.Close()
+			s.conn4500.Close()
+			return fmt.Errorf("ikev2: listen %s: %w", addr500v6, err)
+		}
+		s.conn4500v6, err = net.ListenUDP("udp6", mustResolveUDP("udp6", addr4500v6))
+		if err != nil {
+			s.conn500.Close()
+			s.conn4500.Close()
+			s.conn500v6.Close()
+			return fmt.Errorf("ikev2: listen %s: %w", addr4500v6, err)
+		}
+		if err := setUDPEncapESP(s.conn4500v6); err != nil {
+			s.conn500.Close()
+			s.conn4500.Close()
+			s.conn500v6.Close()
+			s.conn4500v6.Close()
+			return fmt.Errorf("ikev2: set UDP_ENCAP_ESPINUDP on %s: %w", addr4500v6, err)
+		}
+
+		s.log.Info("IKEv2 listening (IPv6)", "ike", addr500v6, "natt", addr4500v6)
+
+		go s.readLoop(s.conn500v6, false)
+		go s.readLoop(s.conn4500v6, true)
+	}
+
 	go s.reaperLoop()
 	return nil
 }
@@ -141,6 +177,12 @@ func (s *Server) Close() {
 	}
 	if s.conn4500 != nil {
 		s.conn4500.Close()
+	}
+	if s.conn500v6 != nil {
+		s.conn500v6.Close()
+	}
+	if s.conn4500v6 != nil {
+		s.conn4500v6.Close()
 	}
 }
 
@@ -229,8 +271,8 @@ func (s *Server) deleteSA(spiI uint64) {
 }
 
 
-func mustResolveUDP(addr string) *net.UDPAddr {
-	a, err := net.ResolveUDPAddr("udp4", addr)
+func mustResolveUDP(network, addr string) *net.UDPAddr {
+	a, err := net.ResolveUDPAddr(network, addr)
 	if err != nil {
 		panic(err)
 	}

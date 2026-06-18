@@ -437,8 +437,16 @@ func (s *Server) migrateMobikeXFRM(sa *ikeSA, newRemote *net.UDPAddr) error {
 	oldParams.RemoteIP = sa.remoteAddr.IP
 	oldParams.NATTDstPort = sa.remoteAddr.Port
 
+	if (sa.remoteAddr.IP.To4() == nil) != (newRemote.IP.To4() == nil) {
+		// MOBIKE path migration across address families (v4<->v6) would require
+		// tearing down and re-keying the XFRM SA under a different family, not
+		// just patching endpoints — explicitly unsupported, reject rather than
+		// silently corrupt the SA.
+		return fmt.Errorf("mobike: cross-family migration unsupported (old=%v new=%v)", sa.remoteAddr.IP, newRemote.IP)
+	}
+
 	newParams := base
-	newParams.RemoteIP = newRemote.IP.To4()
+	newParams.RemoteIP = newRemote.IP
 	newParams.NATTDstPort = newRemote.Port
 
 	return xfrm.MigrateChildSA(oldParams, newParams)

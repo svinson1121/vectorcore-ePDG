@@ -40,6 +40,10 @@ type IKEv2Config struct {
 	// ListenAddr is the IP to bind IKEv2 listeners on port 500 and 4500.
 	// Default "0.0.0.0" listens on all interfaces.
 	ListenAddr string
+	// ListenAddrV6 is the IPv6 address to additionally bind IKEv2 listeners on.
+	// Empty (default) disables IPv6 — only ListenAddr (IPv4) is bound. Set to
+	// "::" or a specific IPv6 address to enable dual-stack listening.
+	ListenAddrV6 string
 	// ListenIfname optionally restricts listening to a named interface.
 	ListenIfname string
 	// CertFile is the path to the ePDG X.509 certificate (PEM).
@@ -204,6 +208,8 @@ func setValue(cfg *Config, section, key, value string) error {
 		switch key {
 		case "listen_addr":
 			cfg.IKEv2.ListenAddr = value
+		case "listen_addr_v6":
+			cfg.IKEv2.ListenAddrV6 = value
 		case "listen_ifname":
 			cfg.IKEv2.ListenIfname = value
 		case "cert_file":

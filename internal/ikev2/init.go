@@ -150,9 +150,9 @@ func (s *Server) handleIKESAInit(conn *net.UDPConn, remote *net.UDPAddr, pkt []b
 	// NAT detection notifies (RFC 7296 §2.23).
 	localUDPAddr := conn.LocalAddr().(*net.UDPAddr)
 	payloads.BuildNotification(message.TypeNone, message.NAT_DETECTION_SOURCE_IP, nil,
-		natHash(spiI, spiR, localUDPAddr.IP.To4(), uint16(localUDPAddr.Port)))
+		natHash(spiI, spiR, localUDPAddr.IP, uint16(localUDPAddr.Port)))
 	payloads.BuildNotification(message.TypeNone, message.NAT_DETECTION_DESTINATION_IP, nil,
-		natHash(spiI, spiR, remote.IP.To4(), uint16(remote.Port)))
+		natHash(spiI, spiR, remote.IP, uint16(remote.Port)))
 
 	respMsg := message.NewMessage(spiI, spiR, message.IKE_SA_INIT, true, false, hdr.MessageID, payloads)
 	respBytes, err := respMsg.Encode()
@@ -203,7 +203,7 @@ func detectNAT(notifies []*message.Notification, remote *net.UDPAddr, spiI, spiR
 		if n.NotifyMessageType != message.NAT_DETECTION_SOURCE_IP {
 			continue
 		}
-		expected := natHash(spiI, spiR, remote.IP.To4(), uint16(remote.Port))
+		expected := natHash(spiI, spiR, remote.IP, uint16(remote.Port))
 		if len(n.NotificationData) != len(expected) {
 			return true
 		}
@@ -216,13 +216,25 @@ func detectNAT(notifies []*message.Notification, remote *net.UDPAddr, spiI, spiR
 	return false
 }
 
+// natAddrBytes returns the native byte form of ip: 4 bytes for IPv4, 16 for IPv6.
+func natAddrBytes(ip net.IP) []byte {
+	if v4 := ip.To4(); v4 != nil {
+		return v4
+	}
+	return ip.To16()
+}
+
 // natHash computes SHA1(SPI_i | SPI_r | IP | Port) per RFC 7296 §3.10.1.
+// IP is hashed as 4 bytes for IPv4 or 16 bytes for IPv6 — the buffer is sized
+// to match, since a fixed IPv4-only size would silently truncate a v6 address
+// and corrupt the trailing port field.
 func natHash(spiI, spiR uint64, ip net.IP, port uint16) []byte {
-	buf := make([]byte, 22)
+	addr := natAddrBytes(ip)
+	buf := make([]byte, 16+len(addr)+2)
 	binary.BigEndian.PutUint64(buf[0:], spiI)
 	binary.BigEndian.PutUint64(buf[8:], spiR)
-	copy(buf[16:], ip.To4())
-	binary.BigEndian.PutUint16(buf[20:], port)
+	copy(buf[16:], addr)
+	binary.BigEndian.PutUint16(buf[16+len(addr):], port)
 	h := sha1.New()
 	h.Write(buf)
 	return h.Sum(nil)

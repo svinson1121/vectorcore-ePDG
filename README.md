@@ -27,7 +27,7 @@ VectorCore ePDG
 - **Native Go IKEv2** — Full RFC 7296 state machine: IKE_SA_INIT, IKE_AUTH, CHILD SA, DH key exchange, NAT-T, rekey, reauthentication, DPD
 - **EAP-AKA authentication** — SIM-based auth proxied over SWm Diameter to the HSS/AAA (3GPP TS 29.273)
 - **Kernel IPsec via XFRM** — Inbound/outbound XFRM SAs and policies installed directly in the Linux kernel; ESP-in-UDP for NAT traversal
-- **MOBIKE (RFC 4555)** — IKEv2 Mobility: negotiated in IKE_AUTH, COOKIE2 return-routability challenge/verify, XFRM endpoint migration when the UE changes IP address (e.g. roaming between Wi-Fi networks); IPv4 only
+- **MOBIKE (RFC 4555)** — IKEv2 Mobility: negotiated in IKE_AUTH, COOKIE2 return-routability challenge/verify, XFRM endpoint migration when the UE changes IP address (e.g. roaming between Wi-Fi networks); supported on IPv4 and IPv6, but migrating mid-session between address families (v4 path ↔ v6 path) is rejected and logged
 - **S2b GTPv2-C** — Creates and manages PDN sessions with the PGW (3GPP TS 29.274); Cisco StarOS interop validated
 - **DNS-based PGW discovery** — Per-attach S-NAPTR lookup (3GPP TS 29.303) resolves the PGW-C address from the APN-FQDN, preferring the `x-3gpp-pgw:x-s2b-gtp` service with optional fallback to `x-s5-gtp`/`x-s8-gtp`; falls back to the static `gtp.pgw_gtpc` address on DNS failure or when disabled
 - **BPF GTP-U dataplane** — XDP downlink decap and TC uplink encap with Linux TUN/XFRM integration; GTP-U Echo remains on the UDP/2152 control socket
@@ -36,6 +36,7 @@ VectorCore ePDG
 - **Bidirectional VoWiFi ↔ VoLTE handover** — VoWiFi→VoLTE: detects PGW Cause=10 (Access changed from Non-3GPP to 3GPP) on Delete Bearer and sends SWm STR with Termination-Cause=8 (DIAMETER_USER_MOVED) for clean AAA handover. VoLTE→VoWiFi: detects non-zero INTERNAL_IP4_ADDRESS in IKE_AUTH CFG_REQUEST and sets the Handover Indication (HI) bit in the S2b Create Session Indication IE so the PGW preserves the existing PDN connection and assigns the same IP address
 - **Lifecycle management** — IKE SA delete, CHILD SA delete, DPD, PGW-initiated delete; full teardown of XFRM + GTP-U + S2b state
 - **Reauthentication** — A new IKE_AUTH from an already-attached IMSI+APN (without a handover indication) is treated as an implicit detach of the existing session followed by a fresh PDN attach, per 3GPP TS 23.402
+- **Dual-stack SWu (IPv4 + IPv6 outer tunnel)** — IKEv2 and IPsec/ESP over IPv6 transport in addition to IPv4, opt-in via `ikev2.listen_addr_v6` (3GPP TS 24.302 §7.2.2); the inner PDN connection (PAA, S2b, GTP-U) remains IPv4-only
 - **3GPP compliant** — Implements TS 23.402, TS 24.302, TS 29.273, TS 29.274, TS 29.303, TS 33.402
 
 
@@ -241,7 +242,8 @@ The config file uses a simple `section: / key: value` format. An annotated examp
 
 | Key | Default | Required | Description |
 |---|---|---|---|
-| `listen_addr` | `0.0.0.0` | | IP to bind IKEv2 on ports 500 and 4500 |
+| `listen_addr` | `0.0.0.0` | | IPv4 address to bind IKEv2 on ports 500 and 4500 |
+| `listen_addr_v6` | (disabled) | | IPv6 address to additionally bind (e.g. `::`). Empty/absent = IPv6 disabled; IPv4 behavior is unaffected either way |
 | `listen_ifname` | | | Restrict to a specific network interface by name |
 | `cert_file` | | **yes** | Path to the ePDG X.509 certificate (PEM). Startup fails without it |
 | `key_file` | | | Path to the ePDG private key (PEM) |
@@ -395,7 +397,7 @@ On startup the binary detects and logs which extensions are present (`aes_ni`, `
 
 | Interface / Feature | Standard |
 |---|---|
-| SWu (UE ↔ ePDG) | RFC 7296 (IKEv2), RFC 4187 (EAP-AKA), RFC 4303 (ESP), RFC 3948 (NAT-T) |
+| SWu (UE ↔ ePDG) | RFC 7296 (IKEv2), RFC 4187 (EAP-AKA), RFC 4303 (ESP), RFC 3948 (NAT-T); outer tunnel dual-stack IPv4/IPv6 per TS 24.302 §7.2.2 |
 | MOBIKE | RFC 4555 — IKEv2 Mobility and Multihoming |
 | SWm (ePDG ↔ AAA) | 3GPP TS 29.273 — Diameter EAP-AKA proxy |
 | S2b (ePDG ↔ PGW) | 3GPP TS 29.274 — GTPv2-C |
