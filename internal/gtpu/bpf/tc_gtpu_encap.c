@@ -85,6 +85,17 @@ struct {
     __uint(max_entries, 4096);
 } tft_rule_map SEC(".maps");
 
+/* ul_bearer_counters: TEID (host byte order) → packet/byte counters for
+ * traffic encapsulated onto that bearer. Entries are created lazily on
+ * first packet (see tc_gtpu_encap_func) and deleted from Go when the
+ * bearer/TEID is torn down. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key,   __u32);
+    __type(value, struct bearer_counters);
+    __uint(max_entries, 4096);
+} ul_bearer_counters SEC(".maps");
+
 /* ── Stats ────────────────────────────────────────────────────────────────── */
 
 enum ul_stat {
@@ -308,6 +319,17 @@ int tc_gtpu_encap_func(struct __sk_buff *skb)
     }
 
     stat_inc(UL_STAT_ENCAP_OK);
+
+    struct bearer_counters *bc = bpf_map_lookup_elem(&ul_bearer_counters, &selected_teid);
+    if (!bc) {
+        struct bearer_counters zero = {};
+        bpf_map_update_elem(&ul_bearer_counters, &selected_teid, &zero, BPF_NOEXIST);
+        bc = bpf_map_lookup_elem(&ul_bearer_counters, &selected_teid);
+    }
+    if (bc) {
+        __sync_fetch_and_add(&bc->packets, 1);
+        __sync_fetch_and_add(&bc->bytes, inner_len);
+    }
 
     /* Redirect to S2b interface; kernel fills in Ethernet header via ARP. */
     struct bpf_redir_neigh nh = {};

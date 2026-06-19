@@ -3,7 +3,6 @@ package ikev2
 // IKE SA state.
 
 import (
-	"math/big"
 	"net"
 	"sync"
 	"time"
@@ -39,8 +38,9 @@ type ikeSA struct {
 	proposal *negotiatedProposal
 	saKey    *ikeSAKey
 
-	// DH state
-	dhPriv *big.Int
+	// DH state. dhPriv is opaque: *big.Int for MODP groups, *ecdh.PrivateKey
+	// for ECDH groups — only ever passed back into the same dhGroup.
+	dhPriv any
 	dhPub  []byte // our public value sent in KE response
 
 	// Raw IKE_SA_INIT messages (needed for AUTH payload computation).

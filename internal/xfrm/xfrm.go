@@ -33,9 +33,12 @@ type ChildSAParams struct {
 	IntKeyOut []byte // SK_ar: responder integrity key
 
 	// Algorithm identifiers (Linux kernel crypto API strings).
-	EncAlgName   string // e.g. "cbc(aes)"
-	IntAlgName   string // e.g. "hmac(sha1)", "hmac(sha256)", "hmac(sha512)"
-	IntTruncBits int    // truncated output in bits: 96, 128, or 256
+	EncAlgName string // e.g. "cbc(aes)", "rfc4106(gcm(aes))"
+	// IntAlgName == "" signals an AEAD cipher (EncAlgName covers integrity
+	// too): buildSAs installs EncAlgName as an Aead transform instead of
+	// separate Crypt+Auth ones, and IntKeyIn/Out/IntTruncBits are unused.
+	IntAlgName   string // e.g. "hmac(sha1)", "hmac(sha256)", "hmac(sha512)", or "" for AEAD
+	IntTruncBits int    // truncated output in bits: 96, 128, or 256; unused for AEAD
 
 	// NAT-T: when set, wrap ESP in UDP per RFC 3948.
 	NATT        bool
@@ -118,8 +121,16 @@ var (
 	inboundSPIs   = make(map[uint32]struct{})
 )
 
-func markInbound(spi uint32)   { inboundSPIsMu.Lock(); inboundSPIs[spi] = struct{}{}; inboundSPIsMu.Unlock() }
-func unmarkInbound(spi uint32) { inboundSPIsMu.Lock(); delete(inboundSPIs, spi); inboundSPIsMu.Unlock() }
+func markInbound(spi uint32) {
+	inboundSPIsMu.Lock()
+	inboundSPIs[spi] = struct{}{}
+	inboundSPIsMu.Unlock()
+}
+func unmarkInbound(spi uint32) {
+	inboundSPIsMu.Lock()
+	delete(inboundSPIs, spi)
+	inboundSPIsMu.Unlock()
+}
 func isInbound(spi uint32) bool {
 	inboundSPIsMu.Lock()
 	defer inboundSPIsMu.Unlock()
@@ -191,7 +202,39 @@ func RemoveChildSA(p ChildSAParams) error {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+// gcmICVLenBits is the ICV length, in bits, for the AES-GCM ICV size this
+// ePDG negotiates (ENCR_AES_GCM_16 — RFC 5282, 16-octet/128-bit ICV). The
+// kernel's xfrm_algo_aead.alg_icv_len field is in bits (linux/xfrm.h), not
+// bytes, matching the existing IntTruncBits convention below.
+const gcmICVLenBits = 128
+
+// algoState builds the Auth+Crypt (CBC+HMAC) or Aead (GCM) XfrmStateAlgo
+// fields for one direction's key material. p.IntAlgName == "" is the signal
+// from childAlgNames that the negotiated cipher is AEAD: encKey already
+// includes the 4-byte salt (encrAlg.KeyLen() in internal/ikev2/crypto.go
+// accounts for it) and there is no separate integrity key.
+func algoState(p ChildSAParams, encKey, intKey []byte) (auth, crypt, aead *netlink.XfrmStateAlgo) {
+	if p.IntAlgName == "" {
+		return nil, nil, &netlink.XfrmStateAlgo{
+			Name:   p.EncAlgName,
+			Key:    encKey,
+			ICVLen: gcmICVLenBits,
+		}
+	}
+	return &netlink.XfrmStateAlgo{
+			Name:        p.IntAlgName,
+			Key:         intKey,
+			TruncateLen: p.IntTruncBits,
+		}, &netlink.XfrmStateAlgo{
+			Name: p.EncAlgName,
+			Key:  encKey,
+		}, nil
+}
+
 func buildSAs(p ChildSAParams, localIP, remoteIP net.IP) (*netlink.XfrmState, *netlink.XfrmState) {
+	authIn, cryptIn, aeadIn := algoState(p, p.EncKeyIn, p.IntKeyIn)
+	authOut, cryptOut, aeadOut := algoState(p, p.EncKeyOut, p.IntKeyOut)
+
 	// Inbound SA: UE→ePDG (we decrypt with initiator keys).
 	inbound := &netlink.XfrmState{
 		Src:          remoteIP,
@@ -201,15 +244,9 @@ func buildSAs(p ChildSAParams, localIP, remoteIP net.IP) (*netlink.XfrmState, *n
 		Spi:          int(p.InboundSPI),
 		ReplayWindow: 32,
 		Ifid:         int(p.IfID),
-		Auth: &netlink.XfrmStateAlgo{
-			Name:        p.IntAlgName,
-			Key:         p.IntKeyIn,
-			TruncateLen: p.IntTruncBits,
-		},
-		Crypt: &netlink.XfrmStateAlgo{
-			Name: p.EncAlgName,
-			Key:  p.EncKeyIn,
-		},
+		Auth:         authIn,
+		Crypt:        cryptIn,
+		Aead:         aeadIn,
 	}
 	if p.NATT {
 		inbound.Encap = &netlink.XfrmStateEncap{
@@ -228,15 +265,9 @@ func buildSAs(p ChildSAParams, localIP, remoteIP net.IP) (*netlink.XfrmState, *n
 		Spi:          int(p.OutboundSPI),
 		ReplayWindow: 32,
 		Ifid:         int(p.IfID),
-		Auth: &netlink.XfrmStateAlgo{
-			Name:        p.IntAlgName,
-			Key:         p.IntKeyOut,
-			TruncateLen: p.IntTruncBits,
-		},
-		Crypt: &netlink.XfrmStateAlgo{
-			Name: p.EncAlgName,
-			Key:  p.EncKeyOut,
-		},
+		Auth:         authOut,
+		Crypt:        cryptOut,
+		Aead:         aeadOut,
 	}
 	if p.NATT {
 		outbound.Encap = &netlink.XfrmStateEncap{

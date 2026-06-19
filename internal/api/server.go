@@ -71,7 +71,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.startedAt = time.Now()
 
 	mux := http.NewServeMux()
-	humaConfig := huma.DefaultConfig("VectorCore ePDG Administrative API", s.build.Version)
+	humaConfig := huma.DefaultConfig("VectorCore ePDG", s.build.Version)
 	humaAPI := humago.New(mux, humaConfig)
 
 	s.registerHealth(humaAPI)

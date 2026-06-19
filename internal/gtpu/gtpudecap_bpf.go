@@ -12,6 +12,12 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type GtpuDecapBearerCounters struct {
+	_       structs.HostLayout
+	Packets uint64
+	Bytes   uint64
+}
+
 type GtpuDecapTeidEntry struct {
 	_   structs.HostLayout
 	Paa [4]uint8
@@ -66,9 +72,10 @@ type GtpuDecapProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type GtpuDecapMapSpecs struct {
-	ConfigMap *ebpf.MapSpec `ebpf:"config_map"`
-	DlStats   *ebpf.MapSpec `ebpf:"dl_stats"`
-	TeidMap   *ebpf.MapSpec `ebpf:"teid_map"`
+	ConfigMap        *ebpf.MapSpec `ebpf:"config_map"`
+	DlBearerCounters *ebpf.MapSpec `ebpf:"dl_bearer_counters"`
+	DlStats          *ebpf.MapSpec `ebpf:"dl_stats"`
+	TeidMap          *ebpf.MapSpec `ebpf:"teid_map"`
 }
 
 // GtpuDecapVariableSpecs contains global variables before they are loaded into the kernel.
@@ -97,14 +104,16 @@ func (o *GtpuDecapObjects) Close() error {
 //
 // It can be passed to LoadGtpuDecapObjects or ebpf.CollectionSpec.LoadAndAssign.
 type GtpuDecapMaps struct {
-	ConfigMap *ebpf.Map `ebpf:"config_map"`
-	DlStats   *ebpf.Map `ebpf:"dl_stats"`
-	TeidMap   *ebpf.Map `ebpf:"teid_map"`
+	ConfigMap        *ebpf.Map `ebpf:"config_map"`
+	DlBearerCounters *ebpf.Map `ebpf:"dl_bearer_counters"`
+	DlStats          *ebpf.Map `ebpf:"dl_stats"`
+	TeidMap          *ebpf.Map `ebpf:"teid_map"`
 }
 
 func (m *GtpuDecapMaps) Close() error {
 	return _GtpuDecapClose(
 		m.ConfigMap,
+		m.DlBearerCounters,
 		m.DlStats,
 		m.TeidMap,
 	)

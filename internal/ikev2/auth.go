@@ -492,7 +492,7 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 	// we tell the UE the IKE_AUTH completed.
 	if sa.espProp != nil && sa.localIP != nil {
 		encrIn, integIn, encrOut, integOut := deriveChildSAKeys(sa.saKey, sa.nonceI, sa.nonceR,
-			sa.espProp.encr.KeyLen(), sa.espProp.integ.KeyLen())
+			sa.espProp.encr.KeyLen(), sa.espProp.integKeyLen())
 		encrName, integName, integTrunc := childAlgNames(sa.espProp)
 
 		var remoteTS *net.IPNet
@@ -531,6 +531,8 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 		s.log.Info("IKE_AUTH final: XFRM installed",
 			"inbound_spi", fmt.Sprintf("%08x", sa.localESPSPI),
 			"outbound_spi", fmt.Sprintf("%08x", sa.peerESPSPI),
+			"encr", encrName, "encr_bits", sa.espProp.encr.keyBits,
+			"integ", integName, "pfs", sa.espProp.dhID(),
 			"paa", paa, "natt", sa.natT)
 
 		if s.sessions != nil {
@@ -945,7 +947,9 @@ func buildESPSAResponse(container *message.IKEPayloadContainer, prop *childPropo
 	keyBits := uint16(prop.encr.keyBits)
 	attrType := uint16(message.AttributeTypeKeyLength)
 	p.EncryptionAlgorithm.BuildTransform(message.TypeEncryptionAlgorithm, prop.encr.id, &attrType, &keyBits, nil)
-	p.IntegrityAlgorithm.BuildTransform(message.TypeIntegrityAlgorithm, prop.integ.id, nil, nil, nil)
+	if prop.integ != nil {
+		p.IntegrityAlgorithm.BuildTransform(message.TypeIntegrityAlgorithm, prop.integ.id, nil, nil, nil)
+	}
 	if prop.dh != nil {
 		p.DiffieHellmanGroup.BuildTransform(message.TypeDiffieHellmanGroup, prop.dh.TransformID(), nil, nil, nil)
 	}
@@ -1059,9 +1063,16 @@ func deriveChildSAKeys(saKey *ikeSAKey, nonceI, nonceR []byte, encrKeyLen, integ
 	return take(encrKeyLen), take(integKeyLen), take(encrKeyLen), take(integKeyLen)
 }
 
-// childAlgNames maps a childProposal's algorithm IDs to Linux kernel crypto names.
+// childAlgNames maps a childProposal's algorithm IDs to Linux kernel crypto
+// names. For AEAD ciphers (prop.integ == nil) integName is "" — the kernel
+// XFRM layer (internal/xfrm) uses an empty IntAlgName as the signal to build
+// an Aead transform instead of separate Crypt+Auth ones.
 func childAlgNames(prop *childProposal) (encrName, integName string, integTruncBits int) {
-	// All currently supported encryption algorithms are AES-CBC variants.
+	if prop.encr.IsAEAD() {
+		encrName = "rfc4106(gcm(aes))"
+		return encrName, "", 0
+	}
+	// All other currently supported encryption algorithms are AES-CBC variants.
 	encrName = "cbc(aes)"
 
 	switch prop.integ.id {

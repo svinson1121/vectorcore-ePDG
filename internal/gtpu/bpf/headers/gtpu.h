@@ -42,3 +42,11 @@ struct gtp_hdr_ext {
     __u8  npdu;
     __u8  next_ext;
 } __attribute__((packed));
+
+/* Per-TEID packet/byte counters, keyed by TEID (host byte order) in a
+ * BPF_MAP_TYPE_HASH map. Shared layout for the downlink (dl_bearer_counters)
+ * and uplink (ul_bearer_counters) maps. */
+struct bearer_counters {
+    __u64 packets;
+    __u64 bytes;
+};

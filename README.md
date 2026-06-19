@@ -37,7 +37,7 @@ VectorCore ePDG
 - **Lifecycle management** — IKE SA delete, CHILD SA delete, DPD, PGW-initiated delete; full teardown of XFRM + GTP-U + S2b state
 - **Reauthentication** — A new IKE_AUTH from an already-attached IMSI+APN (without a handover indication) is treated as an implicit detach of the existing session followed by a fresh PDN attach, per 3GPP TS 23.402
 - **Dual-stack SWu (IPv4 + IPv6 outer tunnel)** — IKEv2 and IPsec/ESP over IPv6 transport in addition to IPv4, opt-in via `ikev2.listen_addr_v6` (3GPP TS 24.302 §7.2.2); the inner PDN connection (PAA, S2b, GTP-U) remains IPv4-only
-- **Read-only administrative API** — Huma-based HTTP API (`/api/v1`) for connected subscribers, IKE/IPsec/S2b session detail, and BPF dataplane statistics; OpenAPI spec and Swagger UI at `/docs`. see [docs/API.md](docs/API.md)
+- **Read-only administrative API** — Huma-based HTTP API (`/api/v1`) for connected subscribers, IKE/IPsec/S2b session detail, and BPF dataplane statistics; OpenAPI spec and an interactive docs UI (Stoplight Elements) at `/docs`. Disabled by default; see [docs/API.md](docs/API.md)
 - **3GPP compliant** — Implements TS 23.402, TS 24.302, TS 29.273, TS 29.274, TS 29.303, TS 33.402
 
 
@@ -389,22 +389,22 @@ The following capabilities are planned for future releases. See `docs/` for deta
 
 | Transform | Supported |
 |---|---|
-| Encryption | AES-CBC-128, AES-CBC-256 |
-| Integrity | HMAC-SHA1-96, HMAC-SHA2-256-128, HMAC-SHA2-512-256 |
+| Encryption | AES-GCM-128, AES-GCM-256 (AEAD, combined-mode SK payload encryption per RFC 5282), AES-CBC-128, AES-CBC-256 |
+| Integrity | HMAC-SHA1-96, HMAC-SHA2-256-128, HMAC-SHA2-512-256 (AES-GCM proposals carry no separate integrity transform — combined-mode) |
 | PRF | PRF-HMAC-SHA1, PRF-HMAC-SHA256, PRF-HMAC-SHA512 |
-| Diffie-Hellman | Group 14 (2048-bit MODP), Group 15 (3072-bit MODP) |
+| Diffie-Hellman | Group 20 (384-bit ECP), Group 19 (256-bit ECP), Group 14 (2048-bit MODP), Group 15 (3072-bit MODP) |
 
-Proposals are matched in preference order. Preferred: AES-CBC-256 + HMAC-SHA2-256-128 + PRF-SHA-256 + DH14.
+Proposals are matched in preference order. Preferred: AES-GCM-256 + PRF-SHA-256 + ECP-384 (Group 20); legacy AES-CBC/SHA1/MODP14 handsets still match unchanged.
 
 ### ESP (CHILD SA)
 
 | Transform | Supported |
 |---|---|
-| Encryption | AES-CBC-128, AES-CBC-256 |
-| Integrity | HMAC-SHA1-96, HMAC-SHA2-256-128, HMAC-SHA2-512-256 |
-| PFS | Group 14 or Group 15 (preferred); no-PFS accepted as fallback |
+| Encryption | AES-GCM-128, AES-GCM-256 (AEAD), AES-CBC-128, AES-CBC-256 |
+| Integrity | HMAC-SHA1-96, HMAC-SHA2-256-128, HMAC-SHA2-512-256 (AES-GCM proposals carry no separate integrity transform — combined-mode) |
+| PFS | Group 20 (ECP-384) or Group 19 (ECP-256) preferred, then Group 14/15 (MODP); no-PFS accepted as fallback |
 
-Preferred: AES-CBC-256 + HMAC-SHA2-256-128 + PFS DH14.
+Preferred: AES-GCM-256 + PFS Group 20 (ECP-384); legacy AES-CBC/SHA1/MODP14 handsets still match unchanged.
 
 ### Hardware Acceleration
 

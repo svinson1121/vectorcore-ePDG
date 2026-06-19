@@ -9,16 +9,51 @@ import (
 )
 
 // negotiatedProposal holds the selected transform set for one IKE SA.
+// integ is nil for AEAD ciphers (AES-GCM) — combined-mode encryption carries
+// its own integrity check, so no separate INTEG transform is offered or
+// expected, and SK_ai/SK_ar are zero-length (RFC 5282 §3.1).
 type negotiatedProposal struct {
-	dh    *dhGroup
+	dh    dhGroup
 	encr  *encrAlg
 	integ *integAlg
 	prf   *prfAlg
 }
 
+// integKeyLen returns 0 for AEAD proposals (no separate integrity key)
+// instead of nil-dereferencing p.integ.
+func (p *negotiatedProposal) integKeyLen() int {
+	if p.integ == nil {
+		return 0
+	}
+	return p.integ.KeyLen()
+}
+
+// integID returns 0 for AEAD proposals, for safe logging of the negotiated
+// transform without nil-dereferencing p.integ.
+func (p *negotiatedProposal) integID() uint16 {
+	if p.integ == nil {
+		return 0
+	}
+	return p.integ.id
+}
+
 // supportedIKEProposals lists our IKE SA proposals in preference order,
-// matching the production swanctl config vectorcore-epdg-ims.
+// matching the production swanctl config vectorcore-epdg-ims, plus AES-GCM
+// (docs/ipsec-gaps.md Gap 2 — combined-mode, integ is nil) ahead of AES-CBC,
+// and ECDH groups 19/20 (Gaps 3/4) ahead of the legacy MODP entries. All
+// legacy entries are unchanged and kept for backward compatibility with
+// handsets that don't offer GCM/ECDH.
 var supportedIKEProposals = []negotiatedProposal{
+	{ecdh384Group, encrAesGcm16_256, nil, prfSha256},
+	{ecdh256Group, encrAesGcm16_256, nil, prfSha256},
+	{dhGroup14, encrAesGcm16_256, nil, prfSha256},
+	{ecdh384Group, encrAesGcm16_128, nil, prfSha256},
+	{ecdh256Group, encrAesGcm16_128, nil, prfSha256},
+	{dhGroup14, encrAesGcm16_128, nil, prfSha256},
+	{ecdh384Group, encrAesCbc256, integSha256_128, prfSha256},
+	{ecdh256Group, encrAesCbc256, integSha256_128, prfSha256},
+	{ecdh384Group, encrAesCbc256, integSha512_256, prfSha512},
+	{ecdh256Group, encrAesCbc256, integSha512_256, prfSha512},
 	{dhGroup14, encrAesCbc256, integSha256_128, prfSha256},
 	{dhGroup15, encrAesCbc256, integSha256_128, prfSha256},
 	{dhGroup14, encrAesCbc256, integSha512_256, prfSha512},
@@ -49,7 +84,12 @@ func matchIKEProposal(prop *message.Proposal) *negotiatedProposal {
 		if !hasEncr(prop, supported.encr.id, supported.encr.keyBits) {
 			continue
 		}
-		if !hasInteg(prop, supported.integ.id) {
+		if supported.integ == nil {
+			// AEAD: initiator must not offer a separate INTEG transform.
+			if len(prop.IntegrityAlgorithm) != 0 {
+				continue
+			}
+		} else if !hasInteg(prop, supported.integ.id) {
 			continue
 		}
 		if !hasPRF(prop, supported.prf.id) {
@@ -126,11 +166,13 @@ func buildIKESAPayload(prop *negotiatedProposal, propNum uint8, spi []byte) *mes
 		AttributeType:    message.AttributeTypeKeyLength,
 		AttributeValue:   uint16(prop.encr.keyBits),
 	})
-	// Integrity
-	p.IntegrityAlgorithm = append(p.IntegrityAlgorithm, &message.Transform{
-		TransformType: message.TypeIntegrityAlgorithm,
-		TransformID:   prop.integ.id,
-	})
+	// Integrity (omitted entirely for AEAD proposals — RFC 5282 §3)
+	if prop.integ != nil {
+		p.IntegrityAlgorithm = append(p.IntegrityAlgorithm, &message.Transform{
+			TransformType: message.TypeIntegrityAlgorithm,
+			TransformID:   prop.integ.id,
+		})
+	}
 	// PRF
 	p.PseudorandomFunction = append(p.PseudorandomFunction, &message.Transform{
 		TransformType: message.TypePseudorandomFunction,
@@ -146,16 +188,61 @@ func buildIKESAPayload(prop *negotiatedProposal, propNum uint8, spi []byte) *mes
 // ────────────────────────────────────────────────────────────────────────────
 
 // childProposal holds the selected transforms for a CHILD SA (ESP).
+// integ is nil for AEAD ciphers (AES-GCM) — combined-mode encryption carries
+// its own integrity check, so no separate INTEG transform is offered or
+// expected (RFC 5282 §3). For non-AEAD ciphers (AES-CBC) integ is always set.
 type childProposal struct {
 	encr  *encrAlg
 	integ *integAlg
-	dh    *dhGroup // PFS; nil if no PFS
+	dh    dhGroup // PFS; nil if no PFS
 }
 
-// supportedESPProposals in preference order (swanctl esp_proposals).
-// PFS variants listed first; no-PFS (nil dh) fallbacks follow for UEs that
-// do not include a DH transform in their CHILD_SA proposal.
+// integKeyLen returns 0 for AEAD proposals (no separate integrity key)
+// instead of nil-dereferencing c.integ.
+func (c *childProposal) integKeyLen() int {
+	if c.integ == nil {
+		return 0
+	}
+	return c.integ.KeyLen()
+}
+
+// integID returns 0 for AEAD proposals, for safe logging of the negotiated
+// transform without nil-dereferencing c.integ.
+func (c *childProposal) integID() uint16 {
+	if c.integ == nil {
+		return 0
+	}
+	return c.integ.id
+}
+
+// dhID returns 0 when no PFS was negotiated, for safe logging of the
+// negotiated transform without nil-dereferencing c.dh.
+func (c *childProposal) dhID() uint16 {
+	if c.dh == nil {
+		return 0
+	}
+	return c.dh.TransformID()
+}
+
+// supportedESPProposals in preference order (swanctl esp_proposals), plus
+// AES-GCM (docs/ipsec-gaps.md Gap 1) ahead of AES-CBC, and ECDH groups 19/20
+// PFS entries ahead of the legacy MODP ones (Gaps 3/4). PFS variants listed
+// first within each cipher; no-PFS (nil dh) fallbacks follow for UEs that do
+// not include a DH transform in their CHILD_SA proposal. All pre-existing
+// CBC entries are unchanged for backward compatibility.
 var supportedESPProposals = []childProposal{
+	{encrAesGcm16_256, nil, ecdh384Group},
+	{encrAesGcm16_256, nil, ecdh256Group},
+	{encrAesGcm16_256, nil, dhGroup14},
+	{encrAesGcm16_128, nil, ecdh384Group},
+	{encrAesGcm16_128, nil, ecdh256Group},
+	{encrAesGcm16_128, nil, dhGroup14},
+	{encrAesGcm16_256, nil, nil},
+	{encrAesGcm16_128, nil, nil},
+	{encrAesCbc256, integSha256_128, ecdh384Group},
+	{encrAesCbc256, integSha256_128, ecdh256Group},
+	{encrAesCbc256, integSha512_256, ecdh384Group},
+	{encrAesCbc256, integSha512_256, ecdh256Group},
 	{encrAesCbc256, integSha256_128, dhGroup14},
 	{encrAesCbc256, integSha256_128, dhGroup15},
 	{encrAesCbc256, integSha512_256, dhGroup14},
@@ -184,7 +271,12 @@ func matchESPProposal(prop *message.Proposal) *childProposal {
 		if !hasEncr(prop, supported.encr.id, supported.encr.keyBits) {
 			continue
 		}
-		if !hasInteg(prop, supported.integ.id) {
+		if supported.integ == nil {
+			// AEAD: initiator must not offer a separate INTEG transform.
+			if len(prop.IntegrityAlgorithm) != 0 {
+				continue
+			}
+		} else if !hasInteg(prop, supported.integ.id) {
 			continue
 		}
 		if supported.dh != nil && !hasDH(prop, supported.dh.TransformID()) {

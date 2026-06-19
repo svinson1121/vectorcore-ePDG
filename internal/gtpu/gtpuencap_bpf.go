@@ -12,6 +12,12 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type GtpuEncapBearerCounters struct {
+	_       structs.HostLayout
+	Packets uint64
+	Bytes   uint64
+}
+
 type GtpuEncapIpv4Key struct {
 	_    structs.HostLayout
 	Addr [4]uint8
@@ -96,9 +102,10 @@ type GtpuEncapProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type GtpuEncapMapSpecs struct {
-	TftRuleMap   *ebpf.MapSpec `ebpf:"tft_rule_map"`
-	UeSessionMap *ebpf.MapSpec `ebpf:"ue_session_map"`
-	UlStats      *ebpf.MapSpec `ebpf:"ul_stats"`
+	TftRuleMap       *ebpf.MapSpec `ebpf:"tft_rule_map"`
+	UeSessionMap     *ebpf.MapSpec `ebpf:"ue_session_map"`
+	UlBearerCounters *ebpf.MapSpec `ebpf:"ul_bearer_counters"`
+	UlStats          *ebpf.MapSpec `ebpf:"ul_stats"`
 }
 
 // GtpuEncapVariableSpecs contains global variables before they are loaded into the kernel.
@@ -127,15 +134,17 @@ func (o *GtpuEncapObjects) Close() error {
 //
 // It can be passed to LoadGtpuEncapObjects or ebpf.CollectionSpec.LoadAndAssign.
 type GtpuEncapMaps struct {
-	TftRuleMap   *ebpf.Map `ebpf:"tft_rule_map"`
-	UeSessionMap *ebpf.Map `ebpf:"ue_session_map"`
-	UlStats      *ebpf.Map `ebpf:"ul_stats"`
+	TftRuleMap       *ebpf.Map `ebpf:"tft_rule_map"`
+	UeSessionMap     *ebpf.Map `ebpf:"ue_session_map"`
+	UlBearerCounters *ebpf.Map `ebpf:"ul_bearer_counters"`
+	UlStats          *ebpf.Map `ebpf:"ul_stats"`
 }
 
 func (m *GtpuEncapMaps) Close() error {
 	return _GtpuEncapClose(
 		m.TftRuleMap,
 		m.UeSessionMap,
+		m.UlBearerCounters,
 		m.UlStats,
 	)
 }

@@ -5,6 +5,9 @@ connected subscribers, IKE/IPsec state, S2b sessions, GTP-U bearers, and the
 BPF dataplane. It is built with [Huma](https://github.com/danielgtaylor/huma)
 and is disabled by default.
 
+This document covers the API as actually implemented (`internal/api/`). For
+the original design goals, see `docs/api_handoff.md`.
+
 ## Enabling the API
 
 ```yaml
@@ -35,7 +38,7 @@ ACL in front of it.
   mutates state: no disconnect, no session/bearer deletion, no
   reauthentication trigger.
 - CORS is wide open (`Access-Control-Allow-Origin: *`, `GET, OPTIONS`) so the
-  Swagger UI or a browser-based dashboard can call it from anywhere.
+  `/docs` UI or a browser-based dashboard can call it from anywhere.
 - Errors use Huma's standard problem-details shape:
 
   ```json
@@ -51,7 +54,7 @@ ACL in front of it.
 
 | Path | Purpose |
 |---|---|
-| `/docs` | Swagger UI (note: **not** under `/api/v1` — it's at the server root) |
+| `/docs` | Interactive API docs UI (Stoplight Elements; note: **not** under `/api/v1` — it's at the server root) |
 | `/openapi.json`, `/openapi.yaml` | OpenAPI 3.1 spec |
 | `/openapi-3.0.json`, `/openapi-3.0.yaml` | OpenAPI 3.0 spec (for older tooling) |
 | `/schemas/{name}.json` | JSON Schema for each response type, referenced by `$schema` |
@@ -182,13 +185,12 @@ curl -s http://localhost:8080/api/v1/clients/311435300070599/diag
 }
 ```
 
-> **Known limitation:** `uplink_packets`, `uplink_bytes`, `downlink_packets`,
-> and `downlink_bytes` on each bearer are currently always `0`. The
-> `BearerCounters` struct they're read from (`internal/gtpu/dataplane.go:135`)
-> is never incremented anywhere in the codebase — it's wired but the
-> increment side was never implemented. For real traffic counters right now,
-> use `/stats/bpf` or `/stats/gtpu`, which read from the BPF programs and do
-> update live.
+`uplink_packets`, `uplink_bytes`, `downlink_packets`, and `downlink_bytes` on
+each bearer are populated from per-TEID eBPF counter maps
+(`dl_bearer_counters`/`ul_bearer_counters`), synced into
+`Bearer.Counters` (`internal/gtpu/dataplane.go`) every 60s by
+`Manager.syncBearerCounters`. Verified via unit tests; not yet verified
+against live kernel packet flow in a real lab.
 
 ### GET /sessions, GET /sessions/{imsi}
 
@@ -382,3 +384,4 @@ installation entirely on some 6.x kernels (see `internal/xfrm/xfrm.go`).
 - It runs as its own `http.Server` (`internal/api/server.go`), started and
   stopped alongside the other components (IKEv2, S2b, SWm, GTP-U) from
   `cmd/epdg/main.go`.
+- See `docs/api_handoff.md` for the original design rationale and goals.

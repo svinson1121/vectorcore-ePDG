@@ -55,6 +55,9 @@ func newBPFDataplane(iface string, localGTPUIP net.IP, mode string, maxEntries i
 		if m, ok := spec.Maps["teid_map"]; ok {
 			m.MaxEntries = uint32(maxEntries)
 		}
+		if m, ok := spec.Maps["dl_bearer_counters"]; ok {
+			m.MaxEntries = uint32(maxEntries)
+		}
 	}
 
 	if err := spec.LoadAndAssign(&d.objs, nil); err != nil {
@@ -107,6 +110,27 @@ func (d *BPFDataplane) RemoveTEID(teid uint32) error {
 	err := d.objs.TeidMap.Delete(teid)
 	if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 		return fmt.Errorf("bpf: teid_map delete TEID %d: %w", teid, err)
+	}
+	return nil
+}
+
+// BearerCounter returns the downlink packet/byte counters recorded for teid
+// in dl_bearer_counters. ok is false if no entry exists yet (e.g. the
+// bearer hasn't seen any downlink traffic).
+func (d *BPFDataplane) BearerCounter(teid uint32) (packets, bytes uint64, ok bool) {
+	var c GtpuDecapBearerCounters
+	if err := d.objs.DlBearerCounters.Lookup(teid, &c); err != nil {
+		return 0, 0, false
+	}
+	return c.Packets, c.Bytes, true
+}
+
+// RemoveBearerCounter deletes the dl_bearer_counters entry for teid.
+// Returns nil if the key was absent.
+func (d *BPFDataplane) RemoveBearerCounter(teid uint32) error {
+	err := d.objs.DlBearerCounters.Delete(teid)
+	if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("bpf: dl_bearer_counters delete TEID %d: %w", teid, err)
 	}
 	return nil
 }

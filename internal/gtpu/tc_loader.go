@@ -60,6 +60,9 @@ func newTCDataplane(ifName string, ifID uint32, maxEntries int) (*TCDataplane, e
 		if m, ok := spec.Maps["tft_rule_map"]; ok {
 			m.MaxEntries = uint32(maxEntries)
 		}
+		if m, ok := spec.Maps["ul_bearer_counters"]; ok {
+			m.MaxEntries = uint32(maxEntries)
+		}
 	}
 	if err := spec.LoadAndAssign(&d.objs, nil); err != nil {
 		return nil, fmt.Errorf("tc: load BPF objects: %w", err)
@@ -198,6 +201,27 @@ func (d *TCDataplane) clearTFTRules(paa4 net.IP) error {
 		if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("tc: tft_rule_map delete PAA %s index %d: %w", paa4, i, err)
 		}
+	}
+	return nil
+}
+
+// BearerCounter returns the uplink packet/byte counters recorded for teid
+// in ul_bearer_counters. ok is false if no entry exists yet (e.g. the
+// bearer hasn't seen any uplink traffic).
+func (d *TCDataplane) BearerCounter(teid uint32) (packets, bytes uint64, ok bool) {
+	var c GtpuEncapBearerCounters
+	if err := d.objs.UlBearerCounters.Lookup(teid, &c); err != nil {
+		return 0, 0, false
+	}
+	return c.Packets, c.Bytes, true
+}
+
+// RemoveBearerCounter deletes the ul_bearer_counters entry for teid.
+// Returns nil if the key was absent.
+func (d *TCDataplane) RemoveBearerCounter(teid uint32) error {
+	err := d.objs.UlBearerCounters.Delete(teid)
+	if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("tc: ul_bearer_counters delete TEID %d: %w", teid, err)
 	}
 	return nil
 }

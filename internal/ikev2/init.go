@@ -138,7 +138,9 @@ func (s *Server) handleIKESAInit(conn *net.UDPConn, remote *net.UDPAddr, pkt []b
 	keyBits := uint16(prop.encr.keyBits)
 	attrType := uint16(message.AttributeTypeKeyLength)
 	p.EncryptionAlgorithm.BuildTransform(message.TypeEncryptionAlgorithm, prop.encr.id, &attrType, &keyBits, nil)
-	p.IntegrityAlgorithm.BuildTransform(message.TypeIntegrityAlgorithm, prop.integ.id, nil, nil, nil)
+	if prop.integ != nil {
+		p.IntegrityAlgorithm.BuildTransform(message.TypeIntegrityAlgorithm, prop.integ.id, nil, nil, nil)
+	}
 	p.PseudorandomFunction.BuildTransform(message.TypePseudorandomFunction, prop.prf.id, nil, nil, nil)
 
 	// KE payload.
@@ -189,8 +191,9 @@ func (s *Server) handleIKESAInit(conn *net.UDPConn, remote *net.UDPAddr, pkt []b
 		"spi_i", spiI,
 		"spi_r", spiR,
 		"dh", prop.dh.TransformID(),
+		"encr", prop.encr.id,
 		"encr_bits", prop.encr.keyBits,
-		"integ", prop.integ.id,
+		"integ", prop.integID(),
 		"prf", prop.prf.id,
 		"nat", natDetected,
 		"remote", remote)

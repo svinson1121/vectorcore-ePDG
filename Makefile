@@ -4,10 +4,9 @@ CMD=./cmd/epdg
 GOCACHE?=/tmp/vectorcore-epdg-gocache
 GOMODCACHE?=/tmp/vectorcore-epdg-gomodcache
 GOENV=GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE)
-VERSION?=0.2.9d
-COMMIT?=$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+VERSION?=0.3.5d
 BUILD_DATE?=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS=-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)
+LDFLAGS=-X main.version=$(VERSION) -X main.buildDate=$(BUILD_DATE)
 
 .PHONY: build generate tidy test clean install
 

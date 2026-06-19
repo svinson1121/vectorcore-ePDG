@@ -51,14 +51,15 @@ type Manager struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu                 sync.RWMutex
-	sessionsByID       map[string]*Session
-	sessionsByPAA      map[string]*Session
-	bearersByLocalTEID map[uint32]*BearerRef
-	stats              DataplaneStats
-	stopOnce           sync.Once
-	loopMu             sync.Mutex
-	runningLoops       map[string]bool
+	mu                  sync.RWMutex
+	sessionsByID        map[string]*Session
+	sessionsByPAA       map[string]*Session
+	bearersByLocalTEID  map[uint32]*BearerRef
+	bearersByRemoteTEID map[uint32]*BearerRef
+	stats               DataplaneStats
+	stopOnce            sync.Once
+	loopMu              sync.Mutex
+	runningLoops        map[string]bool
 
 	pathMu      sync.Mutex
 	pathsByPeer map[string]*pathState
@@ -168,13 +169,14 @@ type rollbackState struct {
 
 func NewManager(cfg config.Config, log *slog.Logger) *Manager {
 	return &Manager{
-		cfg:                cfg,
-		log:                log,
-		sessionsByID:       make(map[string]*Session),
-		sessionsByPAA:      make(map[string]*Session),
-		bearersByLocalTEID: make(map[uint32]*BearerRef),
-		runningLoops:       make(map[string]bool),
-		pathsByPeer:        make(map[string]*pathState),
+		cfg:                 cfg,
+		log:                 log,
+		sessionsByID:        make(map[string]*Session),
+		sessionsByPAA:       make(map[string]*Session),
+		bearersByLocalTEID:  make(map[uint32]*BearerRef),
+		bearersByRemoteTEID: make(map[uint32]*BearerRef),
+		runningLoops:        make(map[string]bool),
+		pathsByPeer:         make(map[string]*pathState),
 	}
 }
 
@@ -360,6 +362,7 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 	m.sessionsByID[ds.ID] = ds
 	m.sessionsByPAA[paa.String()] = ds
 	m.bearersByLocalTEID[b.LocalRXTEID] = &BearerRef{SessionID: ds.ID, BearerEBI: b.EBI}
+	m.bearersByRemoteTEID[b.RemoteTXTEID] = &BearerRef{SessionID: ds.ID, BearerEBI: b.EBI}
 	m.mu.Unlock()
 	rb.add(func() { rb.removeSessionState(sess.ID, paa.String()) })
 	if m.bpf != nil {
@@ -438,8 +441,13 @@ func (m *Manager) RemoveSession(ctx context.Context, sess *session.Session) erro
 	if ds != nil {
 		for ebi, b := range ds.Bearers {
 			delete(m.bearersByLocalTEID, b.LocalRXTEID)
+			delete(m.bearersByRemoteTEID, b.RemoteTXTEID)
 			if m.bpf != nil {
 				_ = m.bpf.RemoveTEID(b.LocalRXTEID)
+				_ = m.bpf.RemoveBearerCounter(b.LocalRXTEID)
+			}
+			if m.tc != nil {
+				_ = m.tc.RemoveBearerCounter(b.RemoteTXTEID)
 			}
 			m.log.Info("GTP-U bearer removed", "session_id", sess.ID, "ebi", ebi)
 		}
@@ -484,6 +492,7 @@ func (m *Manager) AddBearer(_ context.Context, sessionID string, b Bearer) error
 	}
 	ds.Bearers[b.EBI] = &b
 	m.bearersByLocalTEID[b.LocalRXTEID] = &BearerRef{SessionID: sessionID, BearerEBI: b.EBI}
+	m.bearersByRemoteTEID[b.RemoteTXTEID] = &BearerRef{SessionID: sessionID, BearerEBI: b.EBI}
 	if m.bpf != nil {
 		if err := m.bpf.AddTEID(b.LocalRXTEID, ds.PAA); err != nil {
 			m.log.Warn("BPF teid_map AddTEID failed for dedicated bearer", "teid", b.LocalRXTEID, "error", err)
@@ -512,8 +521,13 @@ func (m *Manager) RemoveBearer(_ context.Context, sessionID string, ebi uint8) e
 		return nil
 	}
 	delete(m.bearersByLocalTEID, b.LocalRXTEID)
+	delete(m.bearersByRemoteTEID, b.RemoteTXTEID)
 	if m.bpf != nil {
 		_ = m.bpf.RemoveTEID(b.LocalRXTEID)
+		_ = m.bpf.RemoveBearerCounter(b.LocalRXTEID)
+	}
+	if m.tc != nil {
+		_ = m.tc.RemoveBearerCounter(b.RemoteTXTEID)
 	}
 	delete(ds.Bearers, ebi)
 	if err := m.syncTCBPFTFTRulesLocked(ds); err != nil {
@@ -711,6 +725,81 @@ func (m *Manager) bpfStatsLoop(ctx context.Context) {
 			if changed {
 				m.log.Info("BPF XDP downlink stats (60s)", args...)
 			}
+
+			var dl bearerCounterReader
+			if m.bpf != nil {
+				dl = m.bpf
+			}
+			var ul bearerCounterReader
+			if m.tc != nil {
+				ul = m.tc
+			}
+			m.syncBearerCounters(dl, ul)
+		}
+	}
+}
+
+// bearerCounterReader reads per-TEID packet/byte counters from a BPF map.
+// Implemented by *BPFDataplane (dl_bearer_counters) and *TCDataplane
+// (ul_bearer_counters); a small interface lets syncBearerCounters be unit
+// tested without a live BPF map.
+type bearerCounterReader interface {
+	BearerCounter(teid uint32) (packets, bytes uint64, ok bool)
+}
+
+// syncBearerCounters copies per-bearer packet/byte counters from the BPF
+// maps into Bearer.Counters. dl/ul may be nil if the corresponding
+// dataplane isn't attached. Last{Uplink,Downlink}Packet is advanced only
+// when this tick's packet count is higher than the previous tick's for
+// that bearer, giving poll-granularity "last seen" timestamps without any
+// CLOCK_MONOTONIC-to-wall-clock conversion in or out of the BPF program.
+func (m *Manager) syncBearerCounters(dl, ul bearerCounterReader) {
+	if dl == nil && ul == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	if dl != nil {
+		for teid, ref := range m.bearersByLocalTEID {
+			ds := m.sessionsByID[ref.SessionID]
+			if ds == nil {
+				continue
+			}
+			b := ds.Bearers[ref.BearerEBI]
+			if b == nil {
+				continue
+			}
+			packets, bytes, ok := dl.BearerCounter(teid)
+			if !ok {
+				continue
+			}
+			if packets > b.Counters.DownlinkPackets {
+				b.Counters.LastDownlinkPacket = now
+			}
+			b.Counters.DownlinkPackets = packets
+			b.Counters.DownlinkBytes = bytes
+		}
+	}
+	if ul != nil {
+		for teid, ref := range m.bearersByRemoteTEID {
+			ds := m.sessionsByID[ref.SessionID]
+			if ds == nil {
+				continue
+			}
+			b := ds.Bearers[ref.BearerEBI]
+			if b == nil {
+				continue
+			}
+			packets, bytes, ok := ul.BearerCounter(teid)
+			if !ok {
+				continue
+			}
+			if packets > b.Counters.UplinkPackets {
+				b.Counters.LastUplinkPacket = now
+			}
+			b.Counters.UplinkPackets = packets
+			b.Counters.UplinkBytes = bytes
 		}
 	}
 }
@@ -1132,6 +1221,7 @@ func (r *rollbackState) removeSessionState(sessionID, paa string) {
 	if ds != nil {
 		for _, b := range ds.Bearers {
 			delete(r.m.bearersByLocalTEID, b.LocalRXTEID)
+			delete(r.m.bearersByRemoteTEID, b.RemoteTXTEID)
 			r.bearerStateRemoved = true
 		}
 		delete(r.m.sessionsByID, sessionID)

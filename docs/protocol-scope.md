@@ -6,7 +6,7 @@ VectorCore ePDG is a production-grade ePDG implemented as a single self-containe
 
 | Interface | Role | Standard |
 |-----------|------|----------|
-| SWu | UE ↔ ePDG IPsec tunnel | RFC 7296 (IKEv2), RFC 4187 (EAP-AKA), RFC 4303 (ESP), RFC 3948 (NAT-T) |
+| SWu | UE ↔ ePDG IPsec tunnel | RFC 7296 (IKEv2), RFC 4187 (EAP-AKA), RFC 4303 (ESP), RFC 3948 (NAT-T); outer tunnel dual-stack IPv4/IPv6 per TS 24.302 §7.2.2 |
 | SWm | ePDG ↔ AAA EAP-AKA proxy | 3GPP TS 29.273 |
 | S2b | ePDG ↔ PGW PDN session control | 3GPP TS 29.274 |
 | PGW discovery | DNS-based S-NAPTR PGW resolution | 3GPP TS 29.303 |
@@ -17,7 +17,8 @@ VectorCore ePDG is a production-grade ePDG implemented as a single self-containe
 - Native Go IKEv2 engine: IKE_SA_INIT, IKE_AUTH, CHILD SA, DH key exchange, NAT-T, rekey, reauthentication, DPD
 - EAP-AKA authentication proxied over SWm Diameter to AAA/HSS
 - Linux XFRM netlink for kernel IPsec SA and policy installation; ESP-in-UDP for NAT traversal
-- **MOBIKE (RFC 4555)** — IKEv2 Mobility: USE_MOBIKE negotiation in IKE_AUTH, COOKIE2 return-routability challenge/verify, XFRM endpoint migration when the UE changes IP address; IPv4 only
+- **MOBIKE (RFC 4555)** — IKEv2 Mobility: USE_MOBIKE negotiation in IKE_AUTH, COOKIE2 return-routability challenge/verify, XFRM endpoint migration when the UE changes IP address; supported on IPv4 and IPv6, but migrating mid-session between address families (v4 path ↔ v6 path) is rejected and logged
+- **Dual-stack SWu (IPv4 + IPv6 outer tunnel)** — IKEv2 and IPsec/ESP over IPv6 transport in addition to IPv4, opt-in via `ikev2.listen_addr_v6` (3GPP TS 24.302 §7.2.2); the inner PDN connection (PAA, S2b, GTP-U) remains IPv4-only
 - S2b GTPv2-C: Create/Delete Session, Create/Delete/Update Bearer
 - DNS-based PGW discovery (3GPP TS 29.303): per-attach S-NAPTR lookup on the APN-FQDN, preferring `x-3gpp-pgw:x-s2b-gtp` with optional `x-s5-gtp`/`x-s8-gtp` fallback; falls back to static config on DNS failure or when disabled (see `pgw_discovery` in README and `docs/pgw-discovery-fteid-fallback-caveat.md`)
 - BPF GTP-U dataplane over UDP/2152 with Linux TUN/XFRM integration, XDP downlink decap, and TC uplink encap
@@ -30,8 +31,9 @@ VectorCore ePDG is a production-grade ePDG implemented as a single self-containe
 
 ## Known Limitations
 
-- Outer tunnel (SWu IPsec, XFRM, GTP-U) is IPv4 only; IPv6 transport not supported
+- Inner PDN connection (PAA, S2b, GTP-U) remains IPv4 only even when the SWu outer tunnel runs over IPv6
 - P-CSCF IPv6 address delivery to the UE over SWu is supported (RFC 7651 attr 21); this is independent of the outer tunnel transport
 - MOBIKE: NAT re-detection on path migration not implemented; `natT` state assumed stable across address changes
 - MOBIKE: multihoming (simultaneous UE addresses) not supported
+- MOBIKE: cross-family migration (UE moves from a v4 path to a v6 path or vice versa) is rejected and logged, not attempted
 - MOBIKE: in-flight migrations are lost on ePDG restart; UE reconnects normally

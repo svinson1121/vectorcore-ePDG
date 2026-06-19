@@ -276,7 +276,7 @@ func (s *Server) removeXFRMChildSA(sa *ikeSA) {
 
 	encrName, integName, integTrunc := childAlgNames(sa.espProp)
 	encrIn, integIn, encrOut, integOut := deriveChildSAKeys(sa.saKey, sa.nonceI, sa.nonceR,
-		sa.espProp.encr.KeyLen(), sa.espProp.integ.KeyLen())
+		sa.espProp.encr.KeyLen(), sa.espProp.integKeyLen())
 
 	params := xfrm.ChildSAParams{
 		LocalIP:      sa.localIP,
@@ -424,7 +424,7 @@ func (s *Server) migrateMobikeXFRM(sa *ikeSA, newRemote *net.UDPAddr) error {
 
 	encrName, integName, integTrunc := childAlgNames(sa.espProp)
 	encrIn, integIn, encrOut, integOut := deriveChildSAKeys(sa.saKey, sa.nonceI, sa.nonceR,
-		sa.espProp.encr.KeyLen(), sa.espProp.integ.KeyLen())
+		sa.espProp.encr.KeyLen(), sa.espProp.integKeyLen())
 
 	base := xfrm.ChildSAParams{
 		LocalIP:      sa.localIP,

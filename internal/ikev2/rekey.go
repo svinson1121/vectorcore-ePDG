@@ -155,8 +155,9 @@ func deriveIKERekeyKeys(oldKey *ikeSAKey, newProp *negotiatedProposal, dhShared,
 	binary.BigEndian.PutUint64(nonceSeed[len(nonceI)+len(nonceR):], newSPII)
 	binary.BigEndian.PutUint64(nonceSeed[len(nonceI)+len(nonceR)+8:], newSPIR)
 
+	integKeyLen := newProp.integKeyLen()
 	totalLen := newProp.prf.KeyLen() + // SK_d
-		newProp.integ.KeyLen()*2 + // SK_ai + SK_ar
+		integKeyLen*2 + // SK_ai + SK_ar
 		newProp.encr.KeyLen()*2 + // SK_ei + SK_er
 		newProp.prf.KeyLen()*2 // SK_pi + SK_pr
 
@@ -170,8 +171,8 @@ func deriveIKERekeyKeys(oldKey *ikeSAKey, newProp *negotiatedProposal, dhShared,
 		return b
 	}
 	newKey.SK_d = take(newProp.prf.KeyLen())
-	newKey.SK_ai = take(newProp.integ.KeyLen())
-	newKey.SK_ar = take(newProp.integ.KeyLen())
+	newKey.SK_ai = take(integKeyLen)
+	newKey.SK_ar = take(integKeyLen)
 	newKey.SK_ei = take(newProp.encr.KeyLen())
 	newKey.SK_er = take(newProp.encr.KeyLen())
 	newKey.SK_pi = take(newProp.prf.KeyLen())
@@ -287,10 +288,10 @@ func (s *Server) handleChildSARekey(conn *net.UDPConn, remote *net.UDPAddr, sa *
 	var encrIn, integIn, encrOut, integOut []byte
 	if dhShared != nil {
 		encrIn, integIn, encrOut, integOut = deriveChildSAKeysPFS(sa.saKey, dhShared, nonceI, nonceR,
-			prop.encr.KeyLen(), prop.integ.KeyLen())
+			prop.encr.KeyLen(), prop.integKeyLen())
 	} else {
 		encrIn, integIn, encrOut, integOut = deriveChildSAKeys(sa.saKey, nonceI, nonceR,
-			prop.encr.KeyLen(), prop.integ.KeyLen())
+			prop.encr.KeyLen(), prop.integKeyLen())
 	}
 
 	// Traffic selectors: PAA from session (same as originally negotiated).
@@ -363,7 +364,8 @@ func (s *Server) handleChildSARekey(conn *net.UDPConn, remote *net.UDPAddr, sa *
 		"imsi", sa.imsi,
 		"old_inbound_spi", sa.localESPSPI,
 		"new_inbound_spi", newLocalSPI,
-		"pfs", dhShared != nil)
+		"encr", encrName, "encr_bits", prop.encr.keyBits,
+		"integ", integName, "pfs", dhShared != nil)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -506,5 +508,8 @@ func (s *Server) handleIKESARekey(conn *net.UDPConn, remote *net.UDPAddr, sa *ik
 	s.log.Info("CREATE_CHILD_SA: IKE SA rekeyed",
 		"imsi", sa.imsi,
 		"old_spi_i", sa.spiI,
-		"new_spi_i", newSPII, "new_spi_r", newSPIR)
+		"new_spi_i", newSPII, "new_spi_r", newSPIR,
+		"dh", newProp.dh.TransformID(),
+		"encr", newProp.encr.id, "encr_bits", newProp.encr.keyBits,
+		"integ", newProp.integID(), "prf", newProp.prf.id)
 }

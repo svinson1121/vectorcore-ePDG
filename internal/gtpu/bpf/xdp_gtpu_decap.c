@@ -86,6 +86,17 @@ struct {
     __uint(max_entries, 4096);
 } teid_map SEC(".maps");
 
+/* dl_bearer_counters: TEID (host byte order) → packet/byte counters for
+ * traffic decapsulated to that bearer. Entries are created lazily on first
+ * packet (see gtpu_decap_func) and deleted from Go when the bearer/TEID is
+ * torn down. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key,   __u32);
+    __type(value, struct bearer_counters);
+    __uint(max_entries, 4096);
+} dl_bearer_counters SEC(".maps");
+
 
 /* ── Program ──────────────────────────────────────────────────────────────── */
 
@@ -153,6 +164,8 @@ int gtpu_decap_func(struct xdp_md *ctx) {
     }
     stat_inc(STAT_PAA_MATCH);
 
+    __u16 inner_len = bpf_ntohs(inner->tot_len);
+
     /* ── Strip outer Eth+IP+UDP+GTP-U, rewrite Ethernet header for inner IP.
      * remove_gtp_header copies the Ethernet header just before the inner IP,
      * then calls bpf_xdp_adjust_head to discard the outer headers.
@@ -165,6 +178,18 @@ int gtpu_decap_func(struct xdp_md *ctx) {
     }
 
     stat_inc(STAT_DECAP_PASS);
+
+    struct bearer_counters *bc = bpf_map_lookup_elem(&dl_bearer_counters, &teid);
+    if (!bc) {
+        struct bearer_counters zero = {};
+        bpf_map_update_elem(&dl_bearer_counters, &teid, &zero, BPF_NOEXIST);
+        bc = bpf_map_lookup_elem(&dl_bearer_counters, &teid);
+    }
+    if (bc) {
+        __sync_fetch_and_add(&bc->packets, 1);
+        __sync_fetch_and_add(&bc->bytes, inner_len);
+    }
+
     return XDP_PASS;
 }
 

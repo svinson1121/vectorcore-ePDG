@@ -15,6 +15,7 @@ package ikev2
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdh"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
@@ -33,23 +34,39 @@ import (
 const (
 	prfHmacSha2512      uint16 = 7
 	authHmacSha2512_256 uint16 = 14
+	dh256RandomECP      uint16 = 19 // IANA Group 19 (P-256), RFC 5114/5903
+	dh384RandomECP      uint16 = 20 // IANA Group 20 (P-384), RFC 5114/5903
+	encrAESGCM16        uint16 = 20 // ENCR_AES_GCM_16, RFC 5282 (16-octet ICV)
 )
 
 // ────────────────────────────────────────────────────────────────────────────
 // DH groups
 // ────────────────────────────────────────────────────────────────────────────
 
-type dhGroup struct {
+// dhGroup abstracts a Diffie-Hellman key exchange method (MODP or ECDH).
+// Private keys are opaque (any) since MODP uses *big.Int and ECDH uses
+// *ecdh.PrivateKey; callers only ever pass a value back to the same group
+// that produced it, so the concrete type never needs to leak out.
+type dhGroup interface {
+	TransformID() uint16
+	ByteLen() int
+	GeneratePrivateKey() (any, error)
+	PublicKey(priv any) []byte
+	SharedKey(priv any, peerPubBytes []byte) ([]byte, error)
+}
+
+// modpGroup implements dhGroup for RFC 3526 MODP groups.
+type modpGroup struct {
 	id        uint16
 	prime     *big.Int
 	generator *big.Int
 	byteLen   int
 }
 
-func (g *dhGroup) TransformID() uint16 { return g.id }
-func (g *dhGroup) ByteLen() int        { return g.byteLen }
+func (g *modpGroup) TransformID() uint16 { return g.id }
+func (g *modpGroup) ByteLen() int        { return g.byteLen }
 
-func (g *dhGroup) GeneratePrivateKey() (*big.Int, error) {
+func (g *modpGroup) GeneratePrivateKey() (any, error) {
 	max := new(big.Int).Sub(g.prime, big.NewInt(2))
 	priv, err := rand.Int(rand.Reader, max)
 	if err != nil {
@@ -58,14 +75,16 @@ func (g *dhGroup) GeneratePrivateKey() (*big.Int, error) {
 	return new(big.Int).Add(priv, big.NewInt(2)), nil
 }
 
-func (g *dhGroup) PublicKey(priv *big.Int) []byte {
+func (g *modpGroup) PublicKey(privAny any) []byte {
+	priv := privAny.(*big.Int)
 	pub := new(big.Int).Exp(g.generator, priv, g.prime).Bytes()
 	out := make([]byte, g.byteLen)
 	copy(out[g.byteLen-len(pub):], pub)
 	return out
 }
 
-func (g *dhGroup) SharedKey(priv *big.Int, peerPubBytes []byte) ([]byte, error) {
+func (g *modpGroup) SharedKey(privAny any, peerPubBytes []byte) ([]byte, error) {
+	priv := privAny.(*big.Int)
 	peer := new(big.Int).SetBytes(peerPubBytes)
 	one := big.NewInt(1)
 	pMinus1 := new(big.Int).Sub(g.prime, one)
@@ -78,8 +97,48 @@ func (g *dhGroup) SharedKey(priv *big.Int, peerPubBytes []byte) ([]byte, error) 
 	return out, nil
 }
 
+// ecdhGroup implements dhGroup for NIST curve ECDH groups (RFC 5903).
+// IKEv2 KE payload data for these groups is the raw, uncompressed X9.62
+// point with the leading 0x04 tag stripped (RFC 5903 §7): X | Y, each
+// byteLen bytes — not Go's ecdh.PublicKey.Bytes() encoding, which keeps the
+// 0x04 tag. PublicKey/SharedKey below convert between the two forms.
+type ecdhGroup struct {
+	id      uint16
+	curve   ecdh.Curve
+	byteLen int // length of X (or Y) alone, e.g. 32 for P-256, 48 for P-384
+}
+
+func (g *ecdhGroup) TransformID() uint16 { return g.id }
+func (g *ecdhGroup) ByteLen() int        { return 2 * g.byteLen }
+
+func (g *ecdhGroup) GeneratePrivateKey() (any, error) {
+	return g.curve.GenerateKey(rand.Reader)
+}
+
+func (g *ecdhGroup) PublicKey(privAny any) []byte {
+	priv := privAny.(*ecdh.PrivateKey)
+	// priv.PublicKey().Bytes() is 0x04 || X || Y; IKEv2 wants X || Y only.
+	return priv.PublicKey().Bytes()[1:]
+}
+
+func (g *ecdhGroup) SharedKey(privAny any, peerPubBytes []byte) ([]byte, error) {
+	if len(peerPubBytes) != 2*g.byteLen {
+		return nil, fmt.Errorf("invalid ECDH public value length %d", len(peerPubBytes))
+	}
+	priv := privAny.(*ecdh.PrivateKey)
+	uncompressed := append([]byte{0x04}, peerPubBytes...)
+	peerPub, err := g.curve.NewPublicKey(uncompressed)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ECDH public value: %w", err)
+	}
+	return priv.ECDH(peerPub)
+}
+
+var ecdh256Group = &ecdhGroup{id: dh256RandomECP, curve: ecdh.P256(), byteLen: 32}
+var ecdh384Group = &ecdhGroup{id: dh384RandomECP, curve: ecdh.P384(), byteLen: 48}
+
 // RFC 3526 Group 14 (2048-bit MODP).
-var dhGroup14 = &dhGroup{
+var dhGroup14 = &modpGroup{
 	id: message.DH_2048_BIT_MODP,
 	prime: mustParseBig("FFFFFFFFFFFFFFFFC90FDAA22168C234" +
 		"C4C6628B80DC1CD129024E088A67CC74" +
@@ -102,7 +161,7 @@ var dhGroup14 = &dhGroup{
 }
 
 // RFC 3526 Group 15 (3072-bit MODP).
-var dhGroup15 = &dhGroup{
+var dhGroup15 = &modpGroup{
 	id: message.DH_3072_BIT_MODP,
 	prime: mustParseBig("FFFFFFFFFFFFFFFFC90FDAA22168C234" +
 		"C4C6628B80DC1CD129024E088A67CC74" +
@@ -132,12 +191,16 @@ var dhGroup15 = &dhGroup{
 	byteLen:   384,
 }
 
-func dhGroupByID(id uint16) *dhGroup {
+func dhGroupByID(id uint16) dhGroup {
 	switch id {
 	case message.DH_2048_BIT_MODP:
 		return dhGroup14
 	case message.DH_3072_BIT_MODP:
 		return dhGroup15
+	case dh256RandomECP:
+		return ecdh256Group
+	case dh384RandomECP:
+		return ecdh384Group
 	}
 	return nil
 }
@@ -241,17 +304,27 @@ func integByID(id uint16) *integAlg {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Encryption (AES-CBC)
+// Encryption (AES-CBC, AES-GCM)
 // ────────────────────────────────────────────────────────────────────────────
 
+// encrAlg describes a negotiable encryption transform. keyBits is the AES
+// key size carried in the wire Key Length attribute (128/256) — it must
+// stay the raw AES key size, not include saltLen, or proposal attribute
+// matching in hasEncr/buildESPSAResponse would offer/expect the wrong value.
+// saltLen is the additional salt appended to the derived key material for
+// AEAD ciphers (4 bytes for GCM per RFC 4106 §8.1); zero for CBC. ESP
+// encryption itself is delegated to the kernel via XFRM (see internal/xfrm),
+// so Encrypt/Decrypt below are only ever used for IKE SA (CBC) traffic.
 type encrAlg struct {
 	id      uint16
 	keyBits int
+	saltLen int
 }
 
 func (e *encrAlg) TransformID() uint16 { return e.id }
-func (e *encrAlg) KeyLen() int         { return e.keyBits / 8 }
+func (e *encrAlg) KeyLen() int         { return e.keyBits/8 + e.saltLen }
 func (e *encrAlg) BlockSize() int      { return aes.BlockSize }
+func (e *encrAlg) IsAEAD() bool        { return e.saltLen > 0 }
 
 func (e *encrAlg) Encrypt(key, plaintext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
@@ -301,17 +374,30 @@ func (e *encrAlg) Decrypt(key, ciphertext []byte) ([]byte, error) {
 var (
 	encrAesCbc128 = &encrAlg{id: message.ENCR_AES_CBC, keyBits: 128}
 	encrAesCbc256 = &encrAlg{id: message.ENCR_AES_CBC, keyBits: 256}
+
+	// AES-GCM with a 16-octet ICV (RFC 5282 / IANA transform ID 20). Currently
+	// ESP-only (docs/ipsec-gaps.md Gap 1) — the kernel performs the AEAD
+	// Seal/Open via XFRM, so these are never passed to encrAlg.Encrypt/Decrypt.
+	encrAesGcm16_128 = &encrAlg{id: encrAESGCM16, keyBits: 128, saltLen: 4}
+	encrAesGcm16_256 = &encrAlg{id: encrAESGCM16, keyBits: 256, saltLen: 4}
 )
 
 func encrByIDAndKeyBits(id uint16, keyBits int) *encrAlg {
-	if id != message.ENCR_AES_CBC {
-		return nil
-	}
-	switch keyBits {
-	case 128:
-		return encrAesCbc128
-	case 256:
-		return encrAesCbc256
+	switch id {
+	case message.ENCR_AES_CBC:
+		switch keyBits {
+		case 128:
+			return encrAesCbc128
+		case 256:
+			return encrAesCbc256
+		}
+	case encrAESGCM16:
+		switch keyBits {
+		case 128:
+			return encrAesGcm16_128
+		case 256:
+			return encrAesGcm16_256
+		}
 	}
 	return nil
 }
@@ -321,14 +407,15 @@ func encrByIDAndKeyBits(id uint16, keyBits int) *encrAlg {
 // ────────────────────────────────────────────────────────────────────────────
 
 // ikeSAKey holds negotiated algorithms and all IKE SA keying material.
+// integ is nil for AEAD ciphers (AES-GCM) — see negotiatedProposal.
 type ikeSAKey struct {
 	// Negotiated algorithms
-	dh    *dhGroup
+	dh    dhGroup
 	encr  *encrAlg
 	integ *integAlg
 	prf   *prfAlg
 
-	// Derived keys
+	// Derived keys. SK_ai/SK_ar are zero-length (not nil) when integ == nil.
 	SK_d  []byte
 	SK_ai []byte
 	SK_ar []byte
@@ -338,7 +425,20 @@ type ikeSAKey struct {
 	SK_pr []byte
 }
 
-// deriveKeys computes SKEYSEED and all SK_* keys per RFC 7296 §2.14.
+// integKeyLen returns 0 for AEAD (integ == nil) instead of nil-dereferencing.
+func (k *ikeSAKey) integKeyLen() int {
+	if k.integ == nil {
+		return 0
+	}
+	return k.integ.KeyLen()
+}
+
+// deriveKeys computes SKEYSEED and all SK_* keys per RFC 7296 §2.14. For
+// AEAD ciphers, SK_ai/SK_ar are taken with length 0 per RFC 5282 §3.1 ("the
+// length of SK_ai and SK_ar MUST be zero for any transform which uses an
+// integrated encryption algorithm") — take(0) is a no-op on the KEYMAT
+// cursor, so this produces the same SK_ei/er/pi/pr as if ai/ar were omitted
+// from the derivation entirely.
 // concatenatedNonce = Ni | Nr
 // dhSharedKey = g^ir
 func (k *ikeSAKey) deriveKeys(concatenatedNonce, dhSharedKey []byte, spiI, spiR uint64) error {
@@ -355,8 +455,9 @@ func (k *ikeSAKey) deriveKeys(concatenatedNonce, dhSharedKey []byte, spiI, spiR 
 	binary.BigEndian.PutUint64(seed[len(concatenatedNonce):], spiI)
 	binary.BigEndian.PutUint64(seed[len(concatenatedNonce)+8:], spiR)
 
+	integKeyLen := k.integKeyLen()
 	totalLen := prf.KeyLen() + // SK_d
-		k.integ.KeyLen()*2 + // SK_ai + SK_ar
+		integKeyLen*2 + // SK_ai + SK_ar
 		k.encr.KeyLen()*2 + // SK_ei + SK_er
 		prf.KeyLen()*2 // SK_pi + SK_pr
 
@@ -370,8 +471,8 @@ func (k *ikeSAKey) deriveKeys(concatenatedNonce, dhSharedKey []byte, spiI, spiR 
 		return b
 	}
 	k.SK_d = take(prf.KeyLen())
-	k.SK_ai = take(k.integ.KeyLen())
-	k.SK_ar = take(k.integ.KeyLen())
+	k.SK_ai = take(integKeyLen)
+	k.SK_ar = take(integKeyLen)
 	k.SK_ei = take(k.encr.KeyLen())
 	k.SK_er = take(k.encr.KeyLen())
 	k.SK_pi = take(prf.KeyLen())
@@ -402,6 +503,10 @@ func prfPlus(h hash.Hash, seed []byte, length int) []byte {
 // innerNextPayload is the payload type of the first inner payload (written into the
 // SK generic header before the HMAC is computed, so the HMAC covers it correctly).
 func encryptSK(saKey *ikeSAKey, innerNextPayload uint8, plainPayloads []byte, ikeMsgHeader []byte) ([]byte, error) {
+	if saKey.encr.IsAEAD() {
+		return encryptSKAEAD(saKey, innerNextPayload, plainPayloads, ikeMsgHeader)
+	}
+
 	ciphertext, err := saKey.encr.Encrypt(saKey.SK_er, plainPayloads)
 	if err != nil {
 		return nil, fmt.Errorf("ikev2 encrypt: %w", err)
@@ -428,6 +533,10 @@ func encryptSK(saKey *ikeSAKey, innerNextPayload uint8, plainPayloads []byte, ik
 // Returns the inner next-payload type (from the SK generic header) and plaintext bytes.
 // Incoming messages use SK_ai for integrity and SK_ei for encryption (initiator keys).
 func decryptSK(saKey *ikeSAKey, msg []byte) (innerNextPayload uint8, plain []byte, err error) {
+	if saKey.encr.IsAEAD() {
+		return decryptSKAEAD(saKey, msg)
+	}
+
 	integLen := saKey.integ.OutputLen()
 	if len(msg) < 28+4+integLen {
 		return 0, nil, fmt.Errorf("ikev2 decrypt: message too short")
@@ -447,4 +556,89 @@ func decryptSK(saKey *ikeSAKey, msg []byte) (innerNextPayload uint8, plain []byt
 	ciphertext := skPayload[4 : len(skPayload)-integLen]
 	plain, err = saKey.encr.Decrypt(saKey.SK_ei, ciphertext)
 	return innerNextPayload, plain, err
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// SK payload encrypt / decrypt — combined-mode / AEAD ciphers (RFC 5282 §3)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Wire format differs from the CBC+HMAC format above: instead of a
+// block-size IV followed by padded ciphertext and a separately-computed
+// trailing HMAC, the Encrypted payload carries an explicit IV (here, 8
+// bytes — enough to make the 12-byte GCM nonce unique per message when
+// combined with the 4-byte salt baked into the key) immediately followed by
+// ciphertext+authentication-tag as one unit (what Go's cipher.AEAD.Seal
+// produces directly). There is no padding (GCM needs none) and no separate
+// integrity key/algorithm — SK_ai/SK_ar are zero-length and unused.
+//
+// The Additional Authenticated Data (AAD) is the IKE header plus the SK
+// payload's own generic header (next-payload, reserved, length) — i.e.
+// everything on the wire before the explicit IV (RFC 5282 §3.1).
+
+func aeadCipher(key []byte, saltLen int) (gcm cipher.AEAD, salt []byte, err error) {
+	if len(key) <= saltLen {
+		return nil, nil, fmt.Errorf("ikev2 AEAD: key too short for salt length %d", saltLen)
+	}
+	aesKey, salt := key[:len(key)-saltLen], key[len(key)-saltLen:]
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	gcm, err = cipher.NewGCM(block)
+	if err != nil {
+		return nil, nil, err
+	}
+	return gcm, salt, nil
+}
+
+func encryptSKAEAD(saKey *ikeSAKey, innerNextPayload uint8, plainPayloads, ikeMsgHeader []byte) ([]byte, error) {
+	gcm, salt, err := aeadCipher(saKey.SK_er, saKey.encr.saltLen)
+	if err != nil {
+		return nil, fmt.Errorf("ikev2 encrypt (AEAD): %w", err)
+	}
+
+	explicitIV := make([]byte, gcm.NonceSize()-len(salt))
+	if _, err := io.ReadFull(rand.Reader, explicitIV); err != nil {
+		return nil, fmt.Errorf("ikev2 encrypt (AEAD): %w", err)
+	}
+	nonce := append(append([]byte{}, salt...), explicitIV...)
+
+	skPayloadLen := 4 + len(explicitIV) + len(plainPayloads) + gcm.Overhead()
+	out := make([]byte, len(ikeMsgHeader)+skPayloadLen)
+	copy(out, ikeMsgHeader)
+	hdrOff := len(ikeMsgHeader)
+	out[hdrOff+0] = innerNextPayload
+	out[hdrOff+1] = 0
+	binary.BigEndian.PutUint16(out[hdrOff+2:], uint16(skPayloadLen))
+	copy(out[hdrOff+4:], explicitIV)
+
+	aad := out[:hdrOff+4] // ikeMsgHeader || SK generic header, before the IV
+	ciphertext := gcm.Seal(nil, nonce, plainPayloads, aad)
+	copy(out[hdrOff+4+len(explicitIV):], ciphertext)
+	return out, nil
+}
+
+func decryptSKAEAD(saKey *ikeSAKey, msg []byte) (innerNextPayload uint8, plain []byte, err error) {
+	gcm, salt, err := aeadCipher(saKey.SK_ei, saKey.encr.saltLen)
+	if err != nil {
+		return 0, nil, fmt.Errorf("ikev2 decrypt (AEAD): %w", err)
+	}
+
+	explicitIVLen := gcm.NonceSize() - len(salt)
+	const hdrLen = 28 + 4 // IKE fixed header + SK generic header
+	if len(msg) < hdrLen+explicitIVLen+gcm.Overhead() {
+		return 0, nil, fmt.Errorf("ikev2 decrypt (AEAD): message too short")
+	}
+
+	innerNextPayload = msg[28]
+	explicitIV := msg[hdrLen : hdrLen+explicitIVLen]
+	nonce := append(append([]byte{}, salt...), explicitIV...)
+	aad := msg[:hdrLen]
+	ciphertext := msg[hdrLen+explicitIVLen:]
+
+	plain, err = gcm.Open(nil, nonce, ciphertext, aad)
+	if err != nil {
+		return 0, nil, fmt.Errorf("ikev2 decrypt (AEAD): integrity check failed: %w", err)
+	}
+	return innerNextPayload, plain, nil
 }
