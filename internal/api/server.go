@@ -82,7 +82,7 @@ func (s *Server) Start(ctx context.Context) error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.ListenAddress, s.cfg.ListenPort)
 	s.httpSrv = &http.Server{
 		Addr:    addr,
-		Handler: corsMiddleware(mux),
+		Handler: mux,
 	}
 
 	ln, err := net.Listen("tcp", addr)
@@ -109,20 +109,6 @@ func (s *Server) Stop() error {
 	return s.httpSrv.Shutdown(ctx)
 }
 
-// corsMiddleware allows browser-based tooling (e.g. the Swagger/docs UI, or a
-// future dashboard) to call this read-only, unauthenticated API from any origin.
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 func (s *Server) registerHealth(api huma.API) {
 	huma.Get(api, basePath+"/health", func(ctx context.Context, _ *struct{}) (*struct{ Body HealthResponse }, error) {
 		return &struct{ Body HealthResponse }{HealthResponse{Status: "ok"}}, nil
@@ -131,7 +117,10 @@ func (s *Server) registerHealth(api huma.API) {
 	huma.Get(api, basePath+"/status", func(ctx context.Context, _ *struct{}) (*struct{ Body StatusResponse }, error) {
 		active := 0
 		for _, sess := range s.sessions.Snapshot() {
-			if sess.State == session.StateActive {
+			sess.RLock()
+			isActive := sess.State == session.StateActive
+			sess.RUnlock()
+			if isActive {
 				active++
 			}
 		}

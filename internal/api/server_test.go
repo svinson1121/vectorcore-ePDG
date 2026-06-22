@@ -181,6 +181,42 @@ func TestStats(t *testing.T) {
 	}
 }
 
+// TestNoWildcardCORS is the regression test for audit finding #12's CORS
+// half: this is a read-only API exposing subscriber identifiers (IMSI, NAI,
+// PAA) and session/topology metadata, with no browser-based consumer today.
+// Until a same- or known-origin UI exists, the server must not send any
+// Access-Control-Allow-Origin header — that header is what lets a browser
+// honor a cross-origin script's read of the response; without it, the
+// browser's own same-origin policy blocks any other origin from reading
+// this data, regardless of HTTP vs HTTPS.
+func TestNoWildcardCORS(t *testing.T) {
+	srv := newTestServer(t)
+	ts := httptest.NewServer(srv.httpSrv.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/health")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want absent", got)
+	}
+
+	req, err := http.NewRequest(http.MethodOptions, ts.URL+"/api/v1/health", nil)
+	if err != nil {
+		t.Fatalf("build OPTIONS request: %v", err)
+	}
+	optResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("OPTIONS: %v", err)
+	}
+	defer optResp.Body.Close()
+	if got := optResp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("OPTIONS Access-Control-Allow-Origin = %q, want absent", got)
+	}
+}
+
 func TestStatsBPF(t *testing.T) {
 	srv := newTestServer(t)
 	rec := doGet(t, srv, "/api/v1/stats/bpf")

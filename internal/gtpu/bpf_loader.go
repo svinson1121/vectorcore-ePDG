@@ -11,6 +11,12 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// config_map keys, mirroring CONFIG_KEY_* in bpf/xdp_gtpu_decap.c.
+const (
+	configKeyLocalIP      uint32 = 0
+	configKeyValidatePeer uint32 = 1
+)
+
 // BPFDataplane manages the XDP downlink decap BPF program and its maps.
 // Zero value is not valid; use newBPFDataplane.
 type BPFDataplane struct {
@@ -25,7 +31,10 @@ type BPFDataplane struct {
 // iface is the NIC name receiving UDP/2152 from the PGW.
 // If empty, the interface that carries localGTPUIP is used.
 // mode must be "generic", "native", or "offload".
-func newBPFDataplane(iface string, localGTPUIP net.IP, mode string, maxEntries int) (*BPFDataplane, error) {
+// validateOuterPeer enables the outer-source-IP check (TS 29.281 §4.3.0):
+// when true, a TEID's G-PDU traffic is dropped unless its outer IP source
+// matches the PGW address that TEID was installed with (see AddTEID).
+func newBPFDataplane(iface string, localGTPUIP net.IP, mode string, maxEntries int, validateOuterPeer bool) (*BPFDataplane, error) {
 	ip4 := localGTPUIP.To4()
 	if ip4 == nil {
 		return nil, fmt.Errorf("bpf: local GTP-U IP must be IPv4, got %s", localGTPUIP)
@@ -65,10 +74,17 @@ func newBPFDataplane(iface string, localGTPUIP net.IP, mode string, maxEntries i
 	}
 
 	ipU32 := binary.LittleEndian.Uint32(ip4)
-	key := uint32(0)
-	if err := d.objs.ConfigMap.Put(key, ipU32); err != nil {
+	if err := d.objs.ConfigMap.Put(configKeyLocalIP, ipU32); err != nil {
 		d.objs.Close()
-		return nil, fmt.Errorf("bpf: write config_map: %w", err)
+		return nil, fmt.Errorf("bpf: write config_map local IP: %w", err)
+	}
+	enforcePeer := uint32(0)
+	if validateOuterPeer {
+		enforcePeer = 1
+	}
+	if err := d.objs.ConfigMap.Put(configKeyValidatePeer, enforcePeer); err != nil {
+		d.objs.Close()
+		return nil, fmt.Errorf("bpf: write config_map validate-peer flag: %w", err)
 	}
 
 	xdpMode, err := parseXDPMode(mode)
@@ -90,15 +106,23 @@ func newBPFDataplane(iface string, localGTPUIP net.IP, mode string, maxEntries i
 	return d, nil
 }
 
-// AddTEID inserts or updates a TEID → PAA entry in teid_map.
-// teid is in host byte order. paa must be a 4-byte IPv4 address.
-func (d *BPFDataplane) AddTEID(teid uint32, paa net.IP) error {
+// AddTEID inserts or updates a TEID → PAA + expected-peer entry in teid_map.
+// teid is in host byte order. paa and pgwAddr must be 4-byte IPv4 addresses;
+// pgwAddr is the PGW GTP-U address this TEID was negotiated with over
+// GTPv2-C/S2b — the only outer source XDP will accept G-PDUs for this TEID
+// from when outer-peer validation is enabled (TS 29.281 §4.3.0; finding #8).
+func (d *BPFDataplane) AddTEID(teid uint32, paa, pgwAddr net.IP) error {
 	ip4 := paa.To4()
 	if ip4 == nil {
 		return fmt.Errorf("bpf: PAA must be IPv4, got %s", paa)
 	}
+	pgw4 := pgwAddr.To4()
+	if pgw4 == nil {
+		return fmt.Errorf("bpf: PGW address must be IPv4, got %s", pgwAddr)
+	}
 	entry := GtpuDecapTeidEntry{}
 	copy(entry.Paa[:], ip4)
+	copy(entry.PgwAddr[:], pgw4)
 	if err := d.objs.TeidMap.Put(teid, entry); err != nil {
 		return fmt.Errorf("bpf: teid_map put TEID %d: %w", teid, err)
 	}

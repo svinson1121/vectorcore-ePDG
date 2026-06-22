@@ -20,7 +20,7 @@ VectorCore ePDG is a production-grade ePDG implemented as a single self-containe
 - **MOBIKE (RFC 4555)** — IKEv2 Mobility: USE_MOBIKE negotiation in IKE_AUTH, COOKIE2 return-routability challenge/verify, XFRM endpoint migration when the UE changes IP address; supported on IPv4 and IPv6, but migrating mid-session between address families (v4 path ↔ v6 path) is rejected and logged
 - **Dual-stack SWu (IPv4 + IPv6 outer tunnel)** — IKEv2 and IPsec/ESP over IPv6 transport in addition to IPv4, opt-in via `ikev2.listen_addr_v6` (3GPP TS 24.302 §7.2.2); the inner PDN connection (PAA, S2b, GTP-U) remains IPv4-only
 - S2b GTPv2-C: Create/Delete Session, Create/Delete/Update Bearer
-- DNS-based PGW discovery (3GPP TS 29.303): per-attach S-NAPTR lookup on the APN-FQDN, preferring `x-3gpp-pgw:x-s2b-gtp` with optional `x-s5-gtp`/`x-s8-gtp` fallback; falls back to static config on DNS failure or when disabled (see `pgw_discovery` in README and `docs/pgw-discovery-fteid-fallback-caveat.md`)
+- DNS-based PGW discovery (3GPP TS 29.303): per-attach S-NAPTR lookup on the APN-FQDN, preferring `x-3gpp-pgw:x-s2b-gtp` with optional `x-s5-gtp`/`x-s8-gtp` fallback; falls back to static config on DNS failure or when disabled (see `pgw_discovery` in README)
 - BPF GTP-U dataplane over UDP/2152 with Linux TUN/XFRM integration, XDP downlink decap, and TC uplink encap
 - Dedicated bearer support with TFT uplink packet selection
 - PCO/APCO: DNS and P-CSCF IPv4 (RFC 7651 attr 20)/IPv6 (RFC 7651 attr 21) decoded from S2b and delivered to the UE via IKEv2 CFG_REPLY
@@ -31,6 +31,13 @@ VectorCore ePDG is a production-grade ePDG implemented as a single self-containe
 
 ## Known Limitations
 
+- IKEv2 multiple bearer PDN connectivity (per-bearer CHILD_SA) is not
+  supported — dedicated EPS bearers ride the single CHILD_SA from IKE_AUTH,
+  with bearer separation happening post-decryption via GTP-U TEID/TFT
+  matching, not distinct IPsec SAs. This is a 3GPP-optional feature on both
+  sides (TS 24.302 §7.2.7.1/§7.4.6.1); not implementing it is not a spec
+  violation. See `README.md`'s Known Limitations section for the full
+  explanation and spec citations.
 - Inner PDN connection (PAA, S2b, GTP-U) remains IPv4 only even when the SWu outer tunnel runs over IPv6
 - P-CSCF IPv6 address delivery to the UE over SWu is supported (RFC 7651 attr 21); this is independent of the outer tunnel transport
 - MOBIKE: NAT re-detection on path migration not implemented; `natT` state assumed stable across address changes

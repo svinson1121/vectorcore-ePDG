@@ -28,6 +28,8 @@ func (s *Server) registerSessions(api huma.API) {
 }
 
 func sessionDetail(sess *session.Session) SessionDetail {
+	sess.RLock()
+	defer sess.RUnlock()
 	ueIP := ""
 	if sess.S2B != nil {
 		ueIP = sess.S2B.PAA

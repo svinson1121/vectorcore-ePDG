@@ -51,27 +51,27 @@ func parseChildSAPayloads(firstType uint8, plain []byte) (*childSAPayloads, erro
 		switch message.IkePayloadType(curType) {
 		case message.TypeSA:
 			pl := &message.SecurityAssociation{}
-			if err := pl.Unmarshal(body); err == nil {
+			if err := safePayloadUnmarshal("SA", func() error { return pl.Unmarshal(body) }); err == nil {
 				result.sa = pl
 			}
 		case message.TypeNiNr:
 			pl := &message.Nonce{}
-			if err := pl.Unmarshal(body); err == nil {
+			if err := safePayloadUnmarshal("nonce", func() error { return pl.Unmarshal(body) }); err == nil {
 				result.nonce = pl
 			}
 		case message.TypeKE:
 			pl := &message.KeyExchange{}
-			if err := pl.Unmarshal(body); err == nil {
+			if err := safePayloadUnmarshal("KE", func() error { return pl.Unmarshal(body) }); err == nil {
 				result.ke = pl
 			}
 		case message.TypeTSi:
 			pl := &message.TrafficSelectorInitiator{}
-			if err := pl.Unmarshal(body); err == nil {
+			if err := safePayloadUnmarshal("TSi", func() error { return pl.Unmarshal(body) }); err == nil {
 				result.tsi = pl
 			}
 		case message.TypeTSr:
 			pl := &message.TrafficSelectorResponder{}
-			if err := pl.Unmarshal(body); err == nil {
+			if err := safePayloadUnmarshal("TSr", func() error { return pl.Unmarshal(body) }); err == nil {
 				result.tsr = pl
 			}
 		}

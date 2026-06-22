@@ -19,8 +19,9 @@ type GtpuDecapBearerCounters struct {
 }
 
 type GtpuDecapTeidEntry struct {
-	_   structs.HostLayout
-	Paa [4]uint8
+	_       structs.HostLayout
+	Paa     [4]uint8
+	PgwAddr [4]uint8
 }
 
 // LoadGtpuDecap returns the embedded CollectionSpec for GtpuDecap.

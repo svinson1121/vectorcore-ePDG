@@ -5,8 +5,7 @@ connected subscribers, IKE/IPsec state, S2b sessions, GTP-U bearers, and the
 BPF dataplane. It is built with [Huma](https://github.com/danielgtaylor/huma)
 and is disabled by default.
 
-This document covers the API as actually implemented (`internal/api/`). For
-the original design goals, see `docs/api_handoff.md`.
+This document covers the API as actually implemented (`internal/api/`).
 
 ## Enabling the API
 
@@ -37,8 +36,12 @@ ACL in front of it.
 - All endpoints are `GET`. There is nothing to authenticate and nothing
   mutates state: no disconnect, no session/bearer deletion, no
   reauthentication trigger.
-- CORS is wide open (`Access-Control-Allow-Origin: *`, `GET, OPTIONS`) so the
-  `/docs` UI or a browser-based dashboard can call it from anywhere.
+- No CORS headers are sent (`Access-Control-Allow-Origin` is absent on every
+  response, including `OPTIONS`) — a browser will refuse to let cross-origin
+  JavaScript read the response. The embedded `/docs` UI works because it's
+  served from the same origin as the API; there is no supported way to call
+  this API from a browser-based dashboard hosted elsewhere. `curl`/server-side
+  callers are unaffected, since CORS is a browser-enforced control only.
 - Errors use Huma's standard problem-details shape:
 
   ```json
@@ -384,4 +387,3 @@ installation entirely on some 6.x kernels (see `internal/xfrm/xfrm.go`).
 - It runs as its own `http.Server` (`internal/api/server.go`), started and
   stopped alongside the other components (IKEv2, S2b, SWm, GTP-U) from
   `cmd/epdg/main.go`.
-- See `docs/api_handoff.md` for the original design rationale and goals.

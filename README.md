@@ -77,24 +77,12 @@ apt install clang llvm libbpf-dev
 ## Build
 
 ```bash
+make clean
 make
 ```
 
 Output binary: `bin/epdg`
 
-Build-time variables:
-
-| Variable | Default | Description |
-|---|---|---|
-| `VERSION` | `0.1.1d` | Version string injected via ldflags |
-| `GOCACHE` | `/tmp/vectorcore-epdg-gocache` | Go build cache path |
-| `GOMODCACHE` | `/tmp/vectorcore-epdg-gomodcache` | Go module cache path |
-
-Override at build time:
-
-```bash
-make build VERSION=1.2.0
-```
 
 ### Other targets
 
@@ -252,6 +240,10 @@ The config file uses a simple `section: / key: value` format. An annotated examp
 | `dpd_enabled` | `true` | | Enable Dead Peer Detection |
 | `dpd_delay` | `30` | | Idle seconds before sending a DPD probe |
 | `dpd_timeout` | `120` | | Seconds to wait for a DPD response before tearing down the IKE SA |
+| `max_concurrent_packets` | `2048` | | Cap on concurrently processed inbound IKE packets (resource-exhaustion control) |
+| `half_open_sa_timeout` | `30` | | Seconds an unauthenticated IKE SA (IKE_SA_INIT done, IKE_AUTH not yet complete) may exist before expiry |
+| `max_half_open_sas` | `4096` | | Hard cap on unauthenticated IKE SAs tracked at once; new IKE_SA_INIT requests are rejected at/above this |
+| `cookie_threshold` | `2048` | | Half-open SA count at/above which the RFC 7296 §2.6 COOKIE challenge is required for new IKE_SA_INIT requests |
 
 ### `swm` — SWm Diameter (EAP-AKA proxy)
 
@@ -288,7 +280,7 @@ The config file uses a simple `section: / key: value` format. An annotated examp
 | `dns_enabled` | `false` | Resolve the PGW-C address per attach via S-NAPTR DNS lookup on the APN-FQDN (`<apn>.apn.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org`) instead of using `gtp.pgw_gtpc` directly. Falls back to `gtp.pgw_gtpc` if the lookup fails or returns no usable record |
 | `allow_s5s8_fallback` | `false` | When no `x-3gpp-pgw:x-s2b-gtp` NAPTR record exists, fall back to `x-s5-gtp`/`x-s8-gtp` records. Useful when only an MME-facing PGW record has been published |
 
-The discovery method used for each attach (`static`, `dns_s2b`, or `dns_s5s8_fallback`) is logged at debug level along with the APN and resolved IP. See `docs/pgw-discovery-fteid-fallback-caveat.md` for a known edge case around malformed PGW responses.
+The discovery method used for each attach (`static`, `dns_s2b`, or `dns_s5s8_fallback`) is logged at debug level along with the APN and resolved IP.
 
 Example:
 ```yaml
@@ -296,13 +288,6 @@ pgw_discovery:
   dns_enabled: true
   allow_s5s8_fallback: true
 ```
-
-### `dedicated_bearers` — Dedicated bearer support
-
-| Key | Default | Description |
-|---|---|---|
-| `enabled` | `true` | Handle PGW-initiated Create/Delete/Update Bearer requests |
-| `tft_uplink_selection` | `false` | Apply TFT packet filters for uplink bearer selection |
 
 ### `apn` — APN defaults
 
@@ -376,6 +361,28 @@ api:
 
 See `docs/API.md` for the full endpoint reference and usage examples.
 
+## Known Limitations
+
+### IKEv2 multiple bearer PDN connectivity (per-bearer CHILD_SA)
+
+Not supported. Dedicated EPS bearers are activated over the single CHILD_SA
+established at IKE_AUTH, rather than each getting its own ESP SPI pair via
+an ePDG-initiated CREATE_CHILD_SA exchange. Bearer separation happens
+post-decryption, via GTP-U TEID/TFT matching in the dataplane, not via
+distinct IPsec security associations.
+
+This is a 3GPP-defined optional feature, not a required one, on both sides
+of the negotiation — TS 24.302 §7.2.7.1 ("The UE **may** support the IKEv2
+multiple bearer PDN connectivity...") and §7.4.6.1 ("The ePDG **may**
+support [it]... according to local policy"). When unused, the UE is told via
+the absence of an EPS_QOS Notify in the IKE_AUTH response (§7.4.6.3.2) — a
+defined, non-error fallback, not a rejected attach. The ePDG logs (without
+acting on) any UE's `IKEV2_MULTIPLE_BEARER_PDN_CONNECTIVITY` Notify (TS
+24.302 §8.1.2.3) so real-world demand can be observed before implementing
+the full mechanism, which would also require per-bearer narrowed-selector
+CHILD_SA support in the XFRM/GTP-U dataplane (today, one session = one SPI
+pair).
+
 ## Planned Features
 
 The following capabilities are planned for future releases. See `docs/` for detailed implementation plans where available.
@@ -427,6 +434,10 @@ On startup the binary detects and logs which extensions are present (`aes_ni`, `
 | GTP-U dataplane | 3GPP TS 29.281 |
 | Handover | 3GPP TS 23.402 §8.6 (VoWiFi↔VoLTE), TS 24.302 §8.2.3 (VoLTE→VoWiFi CFG_REQUEST) |
 
+The official 3GPP specification documents these citations were verified
+against are archived in `docs/specs/` (see `docs/specs/README.md` for
+versions and checksums). `docs/audit-report.md` documents every security
+finding, fix, and spec verification from this codebase's security audit.
 
 ## Architecture
 

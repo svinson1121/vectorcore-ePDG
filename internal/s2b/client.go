@@ -64,24 +64,24 @@ type CreateBearerEvent struct {
 }
 
 type CreateBearerContext struct {
-	Index          int
-	Instance       uint8
-	EBI            uint8
-	HasEBI         bool
-	UnassignedEBI  bool
-	EBIPayloadHex  string
-	EBIRawIEHex    string
-	EBIChildOffset int
-	EBIDecodeError string
-	PGWUserTEID    uint32
-	PGWUserIP      net.IP
-	PGWFTEIDInst   uint8
-	PGWFTEIDIface  uint8
-	QCI            uint8
-	HasBearerQoS   bool
-	TFTRaw         []byte
-	ChargingID     uint32
-	HasChargingID  bool
+	Index           int
+	Instance        uint8
+	EBI             uint8
+	HasEBI          bool
+	UnassignedEBI   bool
+	EBIPayloadHex   string
+	EBIRawIEHex     string
+	EBIChildOffset  int
+	EBIDecodeError  string
+	PGWUserTEID     uint32
+	PGWUserIP       net.IP
+	PGWFTEIDInst    uint8
+	PGWFTEIDIface   uint8
+	QCI             uint8
+	HasBearerQoS    bool
+	TFTRaw          []byte
+	ChargingID      uint32
+	HasChargingID   bool
 	RawChildIETypes []uint8
 }
 
@@ -192,7 +192,8 @@ type Client struct {
 	localUser    atomic.Uint32
 
 	mu                  sync.Mutex
-	pending             map[uint32]chan message
+	pending             map[uint32]pendingTxn
+	sessionPeers        map[uint32]net.IP // localControlTEID -> trusted PGW control-plane IP (TS 29.274 §4.1/4.2 tunnel identification)
 	createBearerCache   map[string]createBearerResponseCacheEntry
 	deleteHandler       func(context.Context, DeleteSessionEvent)
 	createBearerHandler func(context.Context, CreateBearerEvent) CreateBearerResult
@@ -200,12 +201,23 @@ type Client struct {
 	updateBearerHandler func(context.Context, UpdateBearerEvent) UpdateBearerResult
 }
 
+// pendingTxn tracks an outstanding request awaiting a response: the channel
+// the response is delivered on, and the peer the request was actually sent
+// to. TS 29.274 §4.1/4.2 identify a GTP tunnel by TEID, IP address, and UDP
+// port — matching responses by sequence number alone (the previous behavior)
+// let any host that could reach the GTP-C port spoof a pending response.
+type pendingTxn struct {
+	ch   chan message
+	peer *net.UDPAddr
+}
+
 func NewClient(cfg config.Config, log *slog.Logger) *Client {
 	c := &Client{
 		cfg:               cfg,
 		log:               log,
 		seq:               newSequenceAllocatorWithMax(cfg.GTP.MaxSequence),
-		pending:           make(map[uint32]chan message),
+		pending:           make(map[uint32]pendingTxn),
+		sessionPeers:      make(map[uint32]net.IP),
 		createBearerCache: make(map[string]createBearerResponseCacheEntry),
 	}
 	c.localControl.Store(randUint32())
@@ -369,6 +381,12 @@ func (c *Client) CreateSession(ctx context.Context, req CreateSessionRequest) (*
 	)
 	c.logPCO("S2b PCO", req.IMSI, req.APN, result.ResponsePCO)
 	c.logPCO("S2b APCO", req.IMSI, req.APN, result.ResponseAPCO)
+
+	// Remember the trusted peer for this control TEID so later network-initiated
+	// requests (Delete/Create/Update Bearer) can be checked against it (TS 29.274 §4.1/4.2).
+	c.mu.Lock()
+	c.sessionPeers[localControl] = peer.IP
+	c.mu.Unlock()
 	return result, nil
 }
 
@@ -392,6 +410,14 @@ func (c *Client) Echo(ctx context.Context) (uint8, error) {
 // pgwControlIP is the PGW GTPv2-C control-plane address learned from the Create Session Response
 // F-TEID IE; when nil, the static pgw_gtpc config address is used.
 func (c *Client) DeleteSession(ctx context.Context, pgwControlIP net.IP, pgwControlTEID, localControlTEID, localUserTEID uint32, ebi uint8) error {
+	// Whatever the outcome, the caller is tearing this session down — stop
+	// trusting requests against this control TEID either way.
+	defer func() {
+		c.mu.Lock()
+		delete(c.sessionPeers, localControlTEID)
+		c.mu.Unlock()
+	}()
+
 	peer := c.peer
 	if pgwControlIP != nil {
 		if ip4 := pgwControlIP.To4(); ip4 != nil {
@@ -667,7 +693,7 @@ func (c *Client) transactionTo(ctx context.Context, req message, expected uint8,
 	}
 	ch := make(chan message, 1)
 	c.mu.Lock()
-	c.pending[req.Sequence] = ch
+	c.pending[req.Sequence] = pendingTxn{ch: ch, peer: peer}
 	c.mu.Unlock()
 	defer func() {
 		c.mu.Lock()
@@ -748,40 +774,80 @@ func (c *Client) readLoop(ctx context.Context) {
 			c.log.Warn("S2b GTPv2-C decode failed", "peer", peer.String(), "error", err)
 			continue
 		}
+
+		strict := c.cfg.GTP.StrictPeerCheck
 		c.mu.Lock()
-		ch := c.pending[msg.Sequence]
-		pendingMatch := ch != nil
+		txn, pendingMatch := c.pending[msg.Sequence]
+		expectedPeer := c.sessionPeers[msg.TEID]
 		c.mu.Unlock()
+
+		// TS 29.274 §4.1/4.2 identify a GTP tunnel by TEID, IP address, and UDP
+		// port. A response whose source doesn't match the peer we actually sent
+		// the request to is not a valid match, regardless of sequence number.
+		if pendingMatch && strict && !peer.IP.Equal(txn.peer.IP) {
+			c.log.Warn("S2b GTPv2-C pending response source mismatch, dropped",
+				"type", msg.Type, "seq", msg.Sequence, "peer", peer.String(), "expected_peer", txn.peer.String())
+			pendingMatch = false
+		}
+
 		dispatch := "ignored"
 		if msg.Type == msgEchoRequest {
 			c.log.Debug("S2b GTPv2-C message received", "peer", peer.String(), "type", msg.Type, "seq", msg.Sequence, "teid", msg.TEID, "pending_match", pendingMatch, "dispatch", "echo_request")
 			c.handleEchoRequest(msg, peer)
 			continue
 		}
-		if msg.Type == msgDeleteSessionReq {
-			c.log.Debug("S2b GTPv2-C message received", "peer", peer.String(), "type", msg.Type, "seq", msg.Sequence, "teid", msg.TEID, "pending_match", pendingMatch, "dispatch", "delete_session")
-			c.handleDeleteSessionRequest(ctx, msg, peer)
+		if msg.Type == msgDeleteSessionReq || msg.Type == msgCreateBearerReq || msg.Type == msgDeleteBearerReq || msg.Type == msgUpdateBearerReq {
+			// Network-initiated requests carry our local control TEID. Reject
+			// ones from a source other than the PGW we established this
+			// session with — an unrecognized TEID (expectedPeer == nil) is left
+			// to the handler's existing "context not found" response.
+			if strict && expectedPeer != nil && !peer.IP.Equal(expectedPeer) {
+				c.log.Warn("S2b GTPv2-C network-initiated request source mismatch, rejected",
+					"type", msg.Type, "seq", msg.Sequence, "teid", msg.TEID, "peer", peer.String(), "expected_peer", expectedPeer.String())
+				continue
+			}
+			switch msg.Type {
+			case msgDeleteSessionReq:
+				c.log.Debug("S2b GTPv2-C message received", "peer", peer.String(), "type", msg.Type, "seq", msg.Sequence, "teid", msg.TEID, "pending_match", pendingMatch, "dispatch", "delete_session")
+				c.handleDeleteSessionRequest(ctx, msg, peer)
+			case msgCreateBearerReq:
+				c.log.Debug("S2b GTPv2-C message received", "peer", peer.String(), "type", msg.Type, "seq", msg.Sequence, "teid", msg.TEID, "pending_match", pendingMatch, "dispatch", "create_bearer")
+				c.handleCreateBearerRequest(ctx, msg, peer)
+			case msgDeleteBearerReq:
+				c.log.Debug("S2b GTPv2-C message received", "peer", peer.String(), "type", msg.Type, "seq", msg.Sequence, "teid", msg.TEID, "pending_match", pendingMatch, "dispatch", "delete_bearer")
+				c.handleDeleteBearerRequest(ctx, msg, peer)
+			case msgUpdateBearerReq:
+				c.log.Debug("S2b GTPv2-C message received", "peer", peer.String(), "type", msg.Type, "seq", msg.Sequence, "teid", msg.TEID, "pending_match", pendingMatch, "dispatch", "update_bearer")
+				c.handleUpdateBearerRequest(ctx, msg, peer)
+			}
 			continue
 		}
-		if msg.Type == msgCreateBearerReq {
-			c.log.Debug("S2b GTPv2-C message received", "peer", peer.String(), "type", msg.Type, "seq", msg.Sequence, "teid", msg.TEID, "pending_match", pendingMatch, "dispatch", "create_bearer")
-			c.handleCreateBearerRequest(ctx, msg, peer)
-			continue
-		}
-		if msg.Type == msgDeleteBearerReq {
-			c.log.Debug("S2b GTPv2-C message received", "peer", peer.String(), "type", msg.Type, "seq", msg.Sequence, "teid", msg.TEID, "pending_match", pendingMatch, "dispatch", "delete_bearer")
-			c.handleDeleteBearerRequest(ctx, msg, peer)
-			continue
-		}
-		if msg.Type == msgUpdateBearerReq {
-			c.log.Debug("S2b GTPv2-C message received", "peer", peer.String(), "type", msg.Type, "seq", msg.Sequence, "teid", msg.TEID, "pending_match", pendingMatch, "dispatch", "update_bearer")
-			c.handleUpdateBearerRequest(ctx, msg, peer)
-			continue
-		}
-		if ch != nil {
+		if pendingMatch {
 			dispatch = "pending_response"
 			c.log.Debug("S2b GTPv2-C message received", "peer", peer.String(), "type", msg.Type, "seq", msg.Sequence, "teid", msg.TEID, "pending_match", true, "dispatch", dispatch)
-			ch <- msg
+			// Claim the transaction atomically: remove it from the pending
+			// table before attempting delivery, so a duplicate or
+			// late-arriving response for the same sequence number finds no
+			// pending match on its next pass through this loop instead of
+			// contending for the channel a second time.
+			c.mu.Lock()
+			_, stillPending := c.pending[msg.Sequence]
+			if stillPending {
+				delete(c.pending, msg.Sequence)
+			}
+			c.mu.Unlock()
+			if stillPending {
+				// Non-blocking send: the claim above means at most one
+				// delivery is ever attempted per transaction, but this stays
+				// non-blocking regardless — a duplicate must never be able
+				// to stall the sole read loop (audit finding #10).
+				select {
+				case txn.ch <- msg:
+				default:
+					c.log.Warn("S2b GTPv2-C duplicate response dropped, channel full",
+						"type", msg.Type, "seq", msg.Sequence, "peer", peer.String())
+				}
+			}
 			continue
 		}
 		c.log.Debug("S2b GTPv2-C message received", "peer", peer.String(), "type", msg.Type, "seq", msg.Sequence, "teid", msg.TEID, "pending_match", false, "dispatch", dispatch)
@@ -790,6 +856,10 @@ func (c *Client) readLoop(ctx context.Context) {
 }
 
 func (c *Client) handleDeleteSessionRequest(ctx context.Context, req message, peer *net.UDPAddr) {
+	c.mu.Lock()
+	delete(c.sessionPeers, req.TEID)
+	c.mu.Unlock()
+
 	resp := message{
 		Type:     msgDeleteSessionResp,
 		TEID:     req.TEID,

@@ -6,8 +6,8 @@ epdg:
   mnc_length: 3
 
 logging:
-  level: warn
-  file: /var/log/vectorcore/epdg/epdg.log
+  level: debug
+  file: /opt/vectorcore/log/epdg.log
 
 api:
   # Read-only admin/diagnostics API (Huma). Disabled by default — opt in per deployment.
@@ -25,6 +25,10 @@ ikev2:
   dpd_enabled: true
   dpd_delay: 30
   dpd_timeout: 120  # seconds to wait for DPD response before tearing down
+  max_concurrent_packets: 2048  # cap on in-flight IKE packet goroutines
+  half_open_sa_timeout: 30      # seconds an unauthenticated IKE SA may exist before expiry
+  max_half_open_sas: 4096       # hard cap on unauthenticated IKE SAs tracked at once
+  cookie_threshold: 2048        # half-open SA count at which RFC 7296 COOKIE is required
 
 swm:
   # peer_addr/peer_port is the immediate Diameter peer.
@@ -68,12 +72,8 @@ bpf:
   xdp_interface: ens18       # S2b NIC receiving GTP-U from PGW and used for uplink redirect
   map_max_entries: 20480      # one entry per active UE session
 
-dedicated_bearers:
-  enabled: true
-  tft_uplink_selection: true
-
 apn:
-  default: ims
+  default: ims        # APN to use when the UE dose not request one.
 
 pco:
   enabled: true

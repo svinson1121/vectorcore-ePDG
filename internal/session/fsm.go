@@ -51,6 +51,8 @@ var allowedTransitions = map[State]map[State]bool{
 	},
 }
 
+// Transition must be called with s.Lock held — it's normally one of several
+// field updates a caller makes within a single critical section.
 func (s *Session) Transition(next State) error {
 	if s.State == next {
 		return nil
@@ -62,6 +64,7 @@ func (s *Session) Transition(next State) error {
 	return nil
 }
 
+// CanActivate must be called with s.RLock (or Lock) held.
 func (s *Session) CanActivate() bool {
 	return s.State == StateDatapathInstalling &&
 		len(s.MSK) == 64 &&

@@ -46,7 +46,8 @@ enum xdp_stat {
     STAT_PAA_MATCH     = 7,  /* inner dst == PAA, proceeding to decap */
     STAT_ADJUST_FAIL   = 8,  /* remove_gtp_header or bpf_xdp_adjust_head failed */
     STAT_DECAP_PASS    = 9,  /* XDP_PASS after outer header strip → kernel routes inner IP */
-    STAT_MAX           = 10,
+    STAT_PEER_MISMATCH = 10, /* outer src IP != stored PGW addr (TS 29.281 §4.3.0) → XDP_DROP */
+    STAT_MAX           = 11,
 };
 
 /* dl_stats: per-CPU array so increments are lock-free.
@@ -55,7 +56,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key,   __u32);
     __type(value, __u64);
-    __uint(max_entries, 10); /* == STAT_MAX */
+    __uint(max_entries, 11); /* == STAT_MAX */
 } dl_stats SEC(".maps");
 
 static __always_inline void stat_inc(__u32 idx) {
@@ -66,17 +67,30 @@ static __always_inline void stat_inc(__u32 idx) {
 
 /* ── Maps ─────────────────────────────────────────────────────────────────── */
 
-/* config_map[0] = local GTP-U IP (stored by Go as LittleEndian uint32). */
+/* config_map[0] = local GTP-U IP (stored by Go as LittleEndian uint32).
+ * config_map[1] = outer-peer enforcement flag (0 or 1; mirrors
+ * cfg.GTP.ValidateOuterPeer). */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key,  __u32);
     __type(value, __u32);
-    __uint(max_entries, 1);
+    __uint(max_entries, 2);
 } config_map SEC(".maps");
 
-/* teid_map: TEID (host byte order) → UE PAA (network byte order). */
+#define CONFIG_KEY_LOCAL_IP         0
+#define CONFIG_KEY_VALIDATE_PEER    1
+
+/* teid_map: TEID (host byte order) → UE PAA + expected outer-IP source
+ * (network byte order). TS 29.281 §4.3.0: a GTP-U tunnel endpoint legitimately
+ * receiving from multiple source peers is a handover/multihoming exception
+ * that doesn't apply to the single-PGW S2b topology this ePDG terminates —
+ * each TEID we allocate has exactly one PGW we negotiated it with over
+ * GTPv2-C, so its downlink traffic should only ever arrive from that address
+ * (finding #8: this wasn't enforced, letting any source inject downlink
+ * data for a TEID/PAA pair it merely guessed or observed). */
 struct teid_entry {
     __u8 paa[4];
+    __u8 pgw_addr[4];
 };
 
 struct {
@@ -120,7 +134,7 @@ int gtpu_decap_func(struct xdp_md *ctx) {
     stat_inc(STAT_SEEN);
 
     /* ── Filter: local GTP-U IP only ───────────────────────────────────── */
-    __u32 cfg_key = 0;
+    __u32 cfg_key = CONFIG_KEY_LOCAL_IP;
     __u32 *local_ip = bpf_map_lookup_elem(&config_map, &cfg_key);
     if (!local_ip || pctx.ip4->daddr != *local_ip) {
         stat_inc(STAT_CFG_MISS);
@@ -150,6 +164,19 @@ int gtpu_decap_func(struct xdp_md *ctx) {
         return XDP_PASS; /* unknown TEID -> control socket drop */
     }
     stat_inc(STAT_TEID_HIT);
+
+    /* ── Outer peer validation: src IP must match the PGW this TEID was
+     * negotiated with (TS 29.281 §4.3.0; finding #8) ──────────────────── */
+    __u32 peer_key = CONFIG_KEY_VALIDATE_PEER;
+    __u32 *enforce_peer = bpf_map_lookup_elem(&config_map, &peer_key);
+    if (enforce_peer && *enforce_peer) {
+        __be32 pgw_be;
+        __builtin_memcpy(&pgw_be, entry->pgw_addr, 4);
+        if (pgw_be != 0 && pctx.ip4->saddr != pgw_be) {
+            stat_inc(STAT_PEER_MISMATCH);
+            return XDP_DROP;
+        }
+    }
 
     /* ── Inner IP sanity: dst must match stored PAA ─────────────────────── */
     struct iphdr *inner = (struct iphdr *)pctx.data;

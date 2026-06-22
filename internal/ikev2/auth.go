@@ -12,7 +12,10 @@ package ikev2
 
 import (
 	"context"
+	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha1"
 	"encoding/binary"
 	"encoding/pem"
 	"fmt"
@@ -40,6 +43,17 @@ const (
 	ikeV2KeyPad = "Key Pad for IKEv2"
 
 	authTimeout = 10 * time.Second
+
+	// notifyIKEv2MultipleBearerPDNConnectivity (TS 24.302 §8.1.2.3/§8.2.9.9):
+	// a private status Notify a UE includes in its IKE_AUTH request to
+	// indicate it supports per-bearer CHILD_SA negotiation for dedicated EPS
+	// bearers (TS 24.302 §7.2.7/§7.4.6). Both UE and ePDG support for this
+	// are explicitly optional ("may support") — this ePDG does not
+	// implement the mechanism (see docs/audit-report.md finding #5) and
+	// falls back to the spec-defined single-CHILD_SA behavior regardless.
+	// Detected and logged only, to inform whether implementing the full
+	// mechanism is worth the effort for this deployment's UE fleet.
+	notifyIKEv2MultipleBearerPDNConnectivity uint16 = 42011
 )
 
 // rawPayload implements message.IKEPayload for pre-encoded payload bytes.
@@ -145,16 +159,35 @@ func (s *Server) handleAuthRound1(conn *net.UDPConn, remote *net.UDPAddr, sa *ik
 	}
 
 	// Extract APN from IDr (UE tells us which APN it wants).
-	apn := ""
+	requestedAPN := ""
 	if pl.idr != nil {
-		apn = extractAPN(pl.idr)
+		requestedAPN = extractAPN(pl.idr)
 	}
+	apn := requestedAPN
 	if apn == "" {
 		if s.fullCfg != nil {
 			apn = s.fullCfg.APN.Default
 		}
 		if apn == "" {
 			apn = "ims"
+		}
+	}
+	if requestedAPN != "" {
+		s.log.Info("IKE_AUTH round1: UE requested APN", "imsi", imsi, "apn", requestedAPN, "remote", remote)
+	} else {
+		s.log.Info("IKE_AUTH round1: UE did not request an APN, using default", "imsi", imsi, "default_apn", apn, "remote", remote)
+	}
+
+	// Observe (do not act on) IKEv2 multiple bearer PDN connectivity support.
+	// Both sides are optional per TS 24.302 §7.2.7.1/§7.4.6.1; this ePDG does
+	// not implement the per-bearer CHILD_SA mechanism (finding #5), so this
+	// is purely informational — it does not change how the request is
+	// handled, and not finding it is not a spec violation.
+	for _, n := range pl.notifies {
+		if n.NotifyMessageType == notifyIKEv2MultipleBearerPDNConnectivity {
+			s.log.Info("IKE_AUTH round1: UE supports IKEv2 multiple bearer PDN connectivity (not implemented by this ePDG)",
+				"imsi", imsi, "remote", remote)
+			break
 		}
 	}
 
@@ -201,12 +234,14 @@ func (s *Server) handleAuthRound1(conn *net.UDPConn, remote *net.UDPAddr, sa *ik
 	if s.sessions != nil {
 		sessID := fmt.Sprintf("%016x-%016x", sa.spiI, sa.spiR)
 		sess := s.sessions.GetOrCreate(sessID)
+		sess.Lock()
 		sess.IMSI = imsi
 		sess.NAI = nai
 		sess.APN = apn
 		sess.IkeSPII = sa.spiI
 		sess.IkeSPIR = sa.spiR
 		_ = sess.Transition(session.StateEAPAuthenticating)
+		sess.Unlock()
 		sa.sessionID = sessID
 	}
 
@@ -256,7 +291,9 @@ func (s *Server) handleAuthRound1(conn *net.UDPConn, remote *net.UDPAddr, sa *ik
 	sa.eapRound = 1
 	if s.sessions != nil {
 		if sess := s.sessions.Get(sa.sessionID); sess != nil {
+			sess.Lock()
 			sess.SWMSessionID = result.SessionID
+			sess.Unlock()
 		}
 	}
 
@@ -271,10 +308,21 @@ func (s *Server) handleAuthRound1(conn *net.UDPConn, remote *net.UDPAddr, sa *ik
 		return
 	case swm.EAPStateSuccess:
 		sa.msk = result.MSK
+		// TS 23.003 §19.3.4/19.3.5: when the UE authenticated with a pseudonym
+		// or fast re-authentication identity, sa.imsi was never known locally —
+		// the AAA-resolved Permanent User Identity is now the only IMSI we have.
+		if result.PermanentIdentity != "" {
+			sa.imsi = result.PermanentIdentity
+		}
 		if s.sessions != nil {
 			if sess := s.sessions.Get(sa.sessionID); sess != nil {
+				sess.Lock()
 				sess.MSK = result.MSK
+				if result.PermanentIdentity != "" {
+					sess.IMSI = result.PermanentIdentity
+				}
 				_ = sess.Transition(session.StateEAPAuthenticated)
+				sess.Unlock()
 			}
 		}
 	}
@@ -337,10 +385,20 @@ func (s *Server) handleAuthEAP(conn *net.UDPConn, remote *net.UDPAddr, sa *ikeSA
 		return
 	case swm.EAPStateSuccess:
 		sa.msk = result.MSK
+		// TS 23.003 §19.3.4/19.3.5: when the UE authenticated with a pseudonym
+		// or fast re-authentication identity, sa.imsi was never known locally —
+		// the AAA-resolved Permanent User Identity is now the only IMSI we have.
+		if result.PermanentIdentity != "" {
+			sa.imsi = result.PermanentIdentity
+		}
 		if s.sessions != nil {
 			sess := s.sessions.Get(sa.sessionID)
 			if sess != nil {
+				sess.Lock()
 				sess.MSK = result.MSK
+				if result.PermanentIdentity != "" {
+					sess.IMSI = result.PermanentIdentity
+				}
 				if result.APNProfile != nil && result.APNProfile.AMBRPresent {
 					sess.APNProfile = &session.APNProfile{
 						APN:          result.APNProfile.APN,
@@ -349,6 +407,7 @@ func (s *Server) handleAuthEAP(conn *net.UDPConn, remote *net.UDPAddr, sa *ikeSA
 					}
 				}
 				_ = sess.Transition(session.StateEAPAuthenticated)
+				sess.Unlock()
 			}
 		}
 	}
@@ -394,7 +453,10 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 	// AUTH verification so we never tear down a valid session on an unverified claim.
 	if sa.handoverIP == nil && s.sessions != nil {
 		if oldSess, ok := s.sessions.FindSingleActiveByIMSIAPN(sa.imsi, sa.apn); ok {
-			if oldIKESA := s.lookupSA(oldSess.IkeSPII); oldIKESA != nil {
+			oldSess.RLock()
+			oldSpiI := oldSess.IkeSPII
+			oldSess.RUnlock()
+			if oldIKESA := s.lookupSA(oldSpiI); oldIKESA != nil {
 				oldIKESA.mu.Lock()
 				oldIKESA.state = ikeStateDeleting
 				s.fullTeardown(oldIKESA, "implicit_detach")
@@ -411,9 +473,13 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 	if s.s2b != nil {
 		var ambrUL, ambrDL uint64
 		if s.sessions != nil {
-			if sess := s.sessions.Get(sa.sessionID); sess != nil && sess.APNProfile != nil {
-				ambrUL = sess.APNProfile.AMBRUplink
-				ambrDL = sess.APNProfile.AMBRDownlink
+			if sess := s.sessions.Get(sa.sessionID); sess != nil {
+				sess.RLock()
+				if sess.APNProfile != nil {
+					ambrUL = sess.APNProfile.AMBRUplink
+					ambrDL = sess.APNProfile.AMBRDownlink
+				}
+				sess.RUnlock()
 			}
 		}
 
@@ -462,6 +528,7 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 		if s.sessions != nil {
 			sess := s.sessions.Get(sa.sessionID)
 			if sess != nil {
+				sess.Lock()
 				_ = sess.Transition(session.StateS2BCreateSessionSent)
 				sess.S2B = &session.S2BContext{
 					PAA:              paa.String(),
@@ -475,6 +542,7 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 					PGWRecovery:      r.PGWRecovery,
 				}
 				_ = sess.Transition(session.StateS2BAccepted)
+				sess.Unlock()
 			}
 		}
 	}
@@ -537,10 +605,12 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 
 		if s.sessions != nil {
 			if sess := s.sessions.Get(sa.sessionID); sess != nil {
+				sess.Lock()
 				sess.ESPInboundSPI = sa.localESPSPI
 				sess.ESPOutboundSPI = sa.peerESPSPI
 				sess.OuterIP = sa.remoteAddr.String()
 				_ = sess.Transition(session.StateGTPUInstalling)
+				sess.Unlock()
 			}
 		}
 
@@ -548,6 +618,9 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 		if s.gtpuMgr != nil && s.sessions != nil {
 			if sess := s.sessions.Get(sa.sessionID); sess != nil {
 				ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+				// AddSession takes sess and locks internally for its own field
+				// accesses (including writing sess.Datapath) — do not hold
+				// sess.Lock() across this call.
 				if err := s.gtpuMgr.AddSession(ctx2, sess); err != nil {
 					cancel2()
 					s.log.Error("IKE_AUTH final: GTP-U AddSession failed",
@@ -556,10 +629,16 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 					return
 				}
 				cancel2()
+				sess.Lock()
 				_ = sess.Transition(session.StateDatapathInstalling)
 				_ = sess.Transition(session.StateActive)
+				ebi := uint8(0)
+				if sess.S2B != nil {
+					ebi = sess.S2B.EBI
+				}
+				sess.Unlock()
 				s.log.Info("IKE_AUTH final: GTP-U session installed, session Active",
-					"imsi", sa.imsi, "paa", paa, "ebi", sess.S2B.EBI)
+					"imsi", sa.imsi, "paa", paa, "ebi", ebi)
 			}
 		}
 	}
@@ -574,8 +653,17 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 	responderSigned := concat(sa.initRespRaw, sa.nonceI, macedIDR)
 	ourAUTH := computeEAPAUTH(sa.saKey.prf, sa.msk, responderSigned)
 
-	// Build response: AUTH, SAr2, TSi, TSr, [CP-reply].
+	// Build response: IDr, AUTH, SAr2, TSi, TSr, [CP-reply].
 	var inner message.IKEPayloadContainer
+
+	// TS 24.302 §7.4.1.1: the ePDG shall include the APN (default or
+	// UE-provided — sa.apn already resolved either way) in the "IDr"
+	// payload of the final IKE_AUTH response, ID Type ID_FQDN. This is
+	// separate from the round-1 IDr (the ePDG's own identity, used for the
+	// signature AUTH computation above) — RFC 7296's responder identity for
+	// AUTH purposes was already committed to in round 1 and is unaffected
+	// by this payload.
+	inner.BuildIdentificationResponder(message.ID_FQDN, []byte(sa.apn))
 
 	inner.BuildAuthentication(authMethodSharedKey, ourAUTH)
 
@@ -623,16 +711,34 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 // Helpers: sending responses
 // ────────────────────────────────────────────────────────────────────────────
 
-// sendEAPResponse sends IDr, [CERT], and the given EAP payload.
+// sendEAPResponse sends IDr, [CERT], AUTH, and the given EAP payload.
 // includeID is true for the first response (round 1); false for subsequent EAP rounds.
+//
+// TS 33.402 §8.2.2 step 6 requires the ePDG to send its identity, a certificate,
+// and the AUTH parameter (protecting the IKE_SA_INIT exchange with a public-key
+// signature) together with the first EAP challenge — before EAP, and therefore
+// the EAP MSK, exist. The MSK-based AUTH built in handleAuthFinal is a separate,
+// later value that authenticates the exchange to the UE after EAP succeeds.
 func (s *Server) sendEAPResponse(conn *net.UDPConn, remote *net.UDPAddr, sa *ikeSA, msgID uint32, eapPayload []byte, includeID bool, natt bool) {
 	var inner message.IKEPayloadContainer
 
 	if includeID {
-		inner.BuildIdentificationResponder(message.ID_FQDN, []byte(s.epdgIdentity()))
+		epdgID := s.epdgIdentity()
+		inner.BuildIdentificationResponder(message.ID_FQDN, []byte(epdgID))
 		if len(s.certDER) > 0 {
 			inner.BuildCertificate(certEncodingX509, s.certDER)
 		}
+
+		idrBytes := buildIDAuthBytes(message.ID_FQDN, []byte(epdgID))
+		macedIDR := prfMAC(sa.saKey.prf, sa.saKey.SK_pr, idrBytes)
+		responderSigned := concat(sa.initRespRaw, sa.nonceI, macedIDR)
+		sig, err := s.computeCertAUTH(responderSigned)
+		if err != nil {
+			s.log.Error("IKE_AUTH: signature AUTH failed", "err", err, "remote", remote)
+			s.sendAuthNotify(conn, remote, sa, msgID, message.AUTHENTICATION_FAILED, natt)
+			return
+		}
+		inner.BuildAuthentication(message.RSADigitalSignature, sig)
 	}
 
 	inner = append(inner, &rawPayload{typ: message.TypeEAP, data: eapPayload})
@@ -640,6 +746,19 @@ func (s *Server) sendEAPResponse(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 	if err := s.sendEncryptedResponse(conn, remote, sa, message.IKE_AUTH, msgID, inner, natt); err != nil {
 		s.log.Error("IKE_AUTH: send EAP response failed", "err", err, "remote", remote)
 	}
+}
+
+// computeCertAUTH signs the responder-signed octets (RFC 7296 §2.15) with the
+// ePDG's certificate private key, using AUTH Method 1 "RSA Digital Signature"
+// (RFC 7296 §3.8): PKCS#1 v1.5 padding over a SHA-1 digest. This legacy method
+// (rather than the RFC 7427 generic signature method) is chosen for broad UE
+// interoperability, matching the base RFC 7296 profile TS 33.402 references.
+func (s *Server) computeCertAUTH(signedOctets []byte) ([]byte, error) {
+	if s.privateKey == nil {
+		return nil, fmt.Errorf("no ePDG private key configured")
+	}
+	digest := sha1.Sum(signedOctets)
+	return rsa.SignPKCS1v15(rand.Reader, s.privateKey, crypto.SHA1, digest[:])
 }
 
 // sendAuthNotify sends an AUTHENTICATION_FAILED (or other) notify in an encrypted IKE_AUTH response.
@@ -671,12 +790,10 @@ func (s *Server) sendEncryptedResponse(conn *net.UDPConn, remote *net.UDPAddr, s
 // sendEncryptedRaw encrypts raw inner bytes (may be nil for DPD empty response) and sends the IKE message.
 func (s *Server) sendEncryptedRaw(conn *net.UDPConn, remote *net.UDPAddr, sa *ikeSA, exchType uint8, msgID uint32, innerNextPayload uint8, plain []byte, natt bool) error {
 	// Compute total message length to fill in the IKE header.
-	integLen := sa.saKey.integ.OutputLen()
-	blockSize := sa.saKey.encr.BlockSize()
-	padLen := blockSize - (len(plain) % blockSize)
-	cipherLen := blockSize + len(plain) + padLen
-	skPayloadLen := 4 + cipherLen + integLen
-	totalLen := message.IKE_HEADER_LEN + skPayloadLen
+	totalLen, err := encryptedSKMessageLen(sa.saKey, len(plain))
+	if err != nil {
+		return fmt.Errorf("compute message length: %w", err)
+	}
 
 	hdrBytes := buildIKEHeaderBytes(sa.spiI, sa.spiR, exchType, msgID, totalLen)
 
@@ -745,43 +862,43 @@ func parseAuthPayloads(firstType uint8, plain []byte) (*authPayloads, error) {
 		switch message.IkePayloadType(curType) {
 		case message.TypeIDi:
 			pl := &message.IdentificationInitiator{}
-			if err := pl.Unmarshal(body); err != nil {
+			if err := safePayloadUnmarshal("IDi", func() error { return pl.Unmarshal(body) }); err != nil {
 				return nil, fmt.Errorf("IDi: %w", err)
 			}
 			result.idi = pl
 		case message.TypeIDr:
 			pl := &message.IdentificationResponder{}
-			if err := pl.Unmarshal(body); err != nil {
+			if err := safePayloadUnmarshal("IDr", func() error { return pl.Unmarshal(body) }); err != nil {
 				return nil, fmt.Errorf("IDr: %w", err)
 			}
 			result.idr = pl
 		case message.TypeAUTH:
 			pl := &message.Authentication{}
-			if err := pl.Unmarshal(body); err != nil {
+			if err := safePayloadUnmarshal("AUTH", func() error { return pl.Unmarshal(body) }); err != nil {
 				return nil, fmt.Errorf("AUTH: %w", err)
 			}
 			result.auth = pl
 		case message.TypeSA:
 			pl := &message.SecurityAssociation{}
-			if err := pl.Unmarshal(body); err != nil {
+			if err := safePayloadUnmarshal("SA", func() error { return pl.Unmarshal(body) }); err != nil {
 				return nil, fmt.Errorf("SA: %w", err)
 			}
 			result.sa = pl
 		case message.TypeTSi:
 			pl := &message.TrafficSelectorInitiator{}
-			if err := pl.Unmarshal(body); err != nil {
+			if err := safePayloadUnmarshal("TSi", func() error { return pl.Unmarshal(body) }); err != nil {
 				return nil, fmt.Errorf("TSi: %w", err)
 			}
 			result.tsi = pl
 		case message.TypeTSr:
 			pl := &message.TrafficSelectorResponder{}
-			if err := pl.Unmarshal(body); err != nil {
+			if err := safePayloadUnmarshal("TSr", func() error { return pl.Unmarshal(body) }); err != nil {
 				return nil, fmt.Errorf("TSr: %w", err)
 			}
 			result.tsr = pl
 		case message.TypeCP:
 			pl := &message.Configuration{}
-			if err := pl.Unmarshal(body); err != nil {
+			if err := safePayloadUnmarshal("CP", func() error { return pl.Unmarshal(body) }); err != nil {
 				return nil, fmt.Errorf("CP: %w", err)
 			}
 			result.cp = pl
@@ -790,10 +907,21 @@ func parseAuthPayloads(firstType uint8, plain []byte) (*authPayloads, error) {
 			result.eapRaw = make([]byte, len(body))
 			copy(result.eapRaw, body)
 		case message.TypeN:
-			pl := &message.Notification{}
-			if err := pl.Unmarshal(body); err == nil {
-				result.notifies = append(result.notifies, pl)
+			// Notification payload bodies contain Protocol ID (1 byte),
+			// SPI Size (1 byte), and Notify Message Type (2 bytes) before
+			// any SPI or notification data. free5gc/ike v1.2.1 slices these
+			// fields without checking the minimum body length.
+			if len(body) < 4 {
+				return nil, fmt.Errorf("notification payload too short: %d", len(body))
 			}
+			if spiSize := int(body[1]); spiSize > len(body)-4 {
+				return nil, fmt.Errorf("notification SPI size %d exceeds body length %d", spiSize, len(body))
+			}
+			pl := &message.Notification{}
+			if err := safePayloadUnmarshal("notification", func() error { return pl.Unmarshal(body) }); err != nil {
+				return nil, fmt.Errorf("notification: %w", err)
+			}
+			result.notifies = append(result.notifies, pl)
 		}
 
 		off += payloadLen
@@ -802,12 +930,39 @@ func parseAuthPayloads(firstType uint8, plain []byte) (*authPayloads, error) {
 	return result, nil
 }
 
+// safePayloadUnmarshal prevents malformed peer input from turning bounds-check
+// defects in the third-party IKE payload decoder into a process-wide panic.
+func safePayloadUnmarshal(name string, unmarshal func() error) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("%s payload decoder panic: %v", name, recovered)
+		}
+	}()
+	return unmarshal()
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers: identity and APN extraction
 // ────────────────────────────────────────────────────────────────────────────
 
-// extractNAI parses the IDi payload to extract the NAI and IMSI.
-// NAI format: 0<IMSI>@<realm>  (leading '0' per 3GPP TS 23.003).
+// extractNAI parses the IDi payload into the NAI the AAA server will route
+// and resolve on, and opportunistically a local IMSI when the identity is
+// syntactically a permanent root NAI.
+//
+// TS 33.402 §8.2.2 step 2 / §8.2.3 step 2 explicitly allow IDi to carry an
+// IMSI, an EAP-AKA pseudonym, or a fast re-authentication identity — the ePDG
+// must accept all of them and forward the NAI to AAA as opaque
+// routing/authentication data (TS 23.003 §19.3). A pseudonym or fast
+// re-authentication identity's "digits" are an AAA-assigned opaque value,
+// not an IMSI (TS 23.003 §19.3.4/19.3.5 examples show this directly: the
+// pseudonym/fast-reauth value differs from the real IMSI) — they must never
+// be parsed as one. Only the AAA server can resolve those to a real IMSI
+// (returned in the DEA's Permanent User Identity; see swm.EAPResult.PermanentIdentity).
+//
+// Errors are returned only for a genuinely unusable identity (empty or an
+// unsupported IDi type) — never merely because the identity isn't a
+// permanent root NAI, since rejecting it there is exactly the bug this
+// fixes (audit finding #6).
 func extractNAI(idi *message.IdentificationInitiator) (nai, imsi string, err error) {
 	if len(idi.IDData) == 0 {
 		return "", "", fmt.Errorf("empty IDi data")
@@ -823,24 +978,34 @@ func extractNAI(idi *message.IdentificationInitiator) (nai, imsi string, err err
 	}
 
 	nai = raw
-	// Extract IMSI: strip leading '0', take up to 15 digits before '@'.
+	imsi = permanentIMSIFromNAI(raw)
+	return nai, imsi, nil
+}
+
+// permanentIMSIFromNAI returns the IMSI when local (the NAI's username part)
+// is a TS 23.003 §19.3.2 permanent root NAI — prefix "0" (EAP-AKA) or "6"
+// (EAP-AKA'), followed by a 6-15 digit IMSI — and "" otherwise (pseudonym,
+// fast re-authentication, decorated, or any other identity form: TS 23.003
+// §19.3.4/19.3.5 use prefixes "2"/"7" and "4"/"8" for those, with opaque
+// AAA-assigned digits that must not be mistaken for an IMSI).
+func permanentIMSIFromNAI(raw string) string {
 	local := raw
 	if idx := strings.IndexByte(raw, '@'); idx >= 0 {
 		local = raw[:idx]
 	}
-	if len(local) == 0 || local[0] != '0' {
-		return nai, "", fmt.Errorf("NAI does not start with '0': %q", local)
+	if len(local) == 0 || (local[0] != '0' && local[0] != '6') {
+		return ""
 	}
 	digits := local[1:]
-	if len(digits) == 0 || len(digits) > 15 {
-		return nai, "", fmt.Errorf("invalid IMSI length %d in NAI %q", len(digits), raw)
+	if len(digits) < 6 || len(digits) > 15 {
+		return ""
 	}
 	for _, c := range digits {
 		if c < '0' || c > '9' {
-			return nai, "", fmt.Errorf("non-digit in IMSI from NAI %q", raw)
+			return ""
 		}
 	}
-	return nai, digits, nil
+	return digits
 }
 
 // extractAPN returns the first label of the IDr FQDN as the APN label.

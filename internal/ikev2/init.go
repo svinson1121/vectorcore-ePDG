@@ -22,6 +22,27 @@ func (s *Server) handleIKESAInit(conn *net.UDPConn, remote *net.UDPAddr, pkt []b
 		return
 	}
 
+	// A retransmitted IKE_SA_INIT for an SPI we've already answered doesn't
+	// need to redo any work: resend the cached response instead of repeating
+	// DH/key derivation. Requiring the source to match the original sender
+	// keeps this from being usable to reflect a cached response at a
+	// different address by guessing/colliding a (cryptographically random,
+	// 64-bit) SPI.
+	if existing := s.lookupSA(hdr.InitiatorSPI); existing != nil {
+		existing.mu.Lock()
+		isRetransmit := existing.state == ikeStateAuth &&
+			len(existing.initRespRaw) > 0 &&
+			existing.remoteAddr != nil &&
+			existing.remoteAddr.IP.Equal(remote.IP) && existing.remoteAddr.Port == remote.Port
+		respRaw := existing.initRespRaw
+		existing.mu.Unlock()
+		if isRetransmit {
+			s.log.Debug("IKE_SA_INIT: retransmission, resending cached response", "spi_i", hdr.InitiatorSPI, "remote", remote)
+			s.send(conn, remote, respRaw, natt)
+			return
+		}
+	}
+
 	ikeMsg := new(message.IKEMessage)
 	ikeMsg.IKEHeader = hdr
 	if err := ikeMsg.DecodePayload(pkt[message.IKE_HEADER_LEN:]); err != nil {
@@ -51,6 +72,29 @@ func (s *Server) handleIKESAInit(conn *net.UDPConn, remote *net.UDPAddr, pkt []b
 	if saPayload == nil || kePayload == nil || noncePayload == nil {
 		s.log.Warn("IKE_SA_INIT: missing required payload", "remote", remote)
 		s.sendInitNotify(conn, remote, hdr, message.INVALID_SYNTAX, nil, natt)
+		return
+	}
+
+	// RFC 7296 §2.6 COOKIE challenge: once at/above the configured half-open
+	// load, require proof the initiator can receive traffic at its claimed
+	// source address before doing any DH/key-derivation work or allocating
+	// an SA. Below the threshold, skip the extra round trip entirely.
+	if load := s.saCount(); load >= s.cookieThreshold() {
+		cookie := findNotifyData(notifyPayloads, message.COOKIE)
+		if cookie == nil || !s.cookies.verify(cookie, hdr.InitiatorSPI, remote) {
+			challenge := s.cookies.issue(hdr.InitiatorSPI, remote)
+			s.log.Debug("IKE_SA_INIT: issuing COOKIE challenge", "remote", remote, "half_open", load)
+			s.sendInitNotify(conn, remote, hdr, message.COOKIE, challenge, natt)
+			return
+		}
+	}
+
+	// Hard cap regardless of cookie validity: a verified cookie proves the
+	// initiator can receive traffic at that address, not that there's room
+	// in the half-open SA table.
+	if load := s.saCount(); load >= s.maxHalfOpenSAs() {
+		s.log.Warn("IKE_SA_INIT: half-open SA table full, rejecting", "remote", remote, "count", load)
+		s.sendInitNotify(conn, remote, hdr, message.TEMPORARY_FAILURE, nil, natt)
 		return
 	}
 
@@ -201,6 +245,17 @@ func (s *Server) handleIKESAInit(conn *net.UDPConn, remote *net.UDPAddr, pkt []b
 
 // detectNAT checks the initiator's NAT_DETECTION_SOURCE_IP notify.
 // Returns true if NAT is present between UE and ePDG.
+// findNotifyData returns the NotificationData of the first notify of the
+// given type, or nil if none is present.
+func findNotifyData(notifies []*message.Notification, notifyType uint16) []byte {
+	for _, n := range notifies {
+		if n.NotifyMessageType == notifyType {
+			return n.NotificationData
+		}
+	}
+	return nil
+}
+
 func detectNAT(notifies []*message.Notification, remote *net.UDPAddr, spiI, spiR uint64) bool {
 	for _, n := range notifies {
 		if n.NotifyMessageType != message.NAT_DETECTION_SOURCE_IP {

@@ -55,16 +55,16 @@ const (
 	causeAccessChangedTo3GPP   uint8 = 10 // TS 29.274 Table 8.4-1: Access changed from Non-3GPP to 3GPP (VoWiFi→VoLTE)
 	causeRequestAccepted       uint8 = 16
 	causeContextNotFound       uint8 = 64
-	ratTypeWLAN          uint8 = 3
-	pdnTypeIPv4          uint8 = 1
-	ifaceS5S8SGWGTPU     uint8 = 4
-	ifaceS5S8PGWGTPU     uint8 = 5
-	ifaceS2BePDGGTPC     uint8 = 30
-	ifaceS2BePDGGTPU     uint8 = 31
-	ifaceS2BPGWGTPC      uint8 = 32
-	ifaceS2BPGWGTPU      uint8 = 33
-	defaultEBI           uint8 = 5
-	defaultBearerQCI     uint8 = 8
+	ratTypeWLAN                uint8 = 3
+	pdnTypeIPv4                uint8 = 1
+	ifaceS5S8SGWGTPU           uint8 = 4
+	ifaceS5S8PGWGTPU           uint8 = 5
+	ifaceS2BePDGGTPC           uint8 = 30
+	ifaceS2BePDGGTPU           uint8 = 31
+	ifaceS2BPGWGTPC            uint8 = 32
+	ifaceS2BPGWGTPU            uint8 = 33
+	defaultEBI                 uint8 = 5
+	defaultBearerQCI           uint8 = 8
 
 	// Create Bearer Response Bearer Context: the ePDG's S2b GTP-U endpoint.
 	// Cisco StarOS requires instance 8 for the S2b-U ePDG F-TEID (verified against live PGW).
@@ -209,6 +209,16 @@ func decodeMessage(b []byte) (message, error) {
 		offset += 4
 	}
 	msg.Sequence = read24(b[offset : offset+3])
+	if msg.Sequence < minSequence || msg.Sequence > maxSequence {
+		// Mirror encode()'s bounds check: a message we decode must be
+		// re-encodable (e.g. when relayed or retransmitted) under the same
+		// policy we apply to messages we originate. Sequence 0 in
+		// particular is reserved as "unset" elsewhere in this package
+		// (sequenceAllocator never generates it), so accepting it here
+		// would let a peer hand us a value indistinguishable from that
+		// sentinel.
+		return message{}, fmt.Errorf("GTPv2-C sequence %d outside range", msg.Sequence)
+	}
 	offset += 4
 	msg.Payload = append([]byte(nil), b[offset:]...)
 	return msg, nil

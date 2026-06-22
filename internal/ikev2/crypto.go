@@ -498,6 +498,32 @@ func prfPlus(h hash.Hash, seed []byte, length int) []byte {
 // SK payload encrypt / decrypt (RFC 7296 §3.14)
 // ────────────────────────────────────────────────────────────────────────────
 
+// encryptedSKMessageLen returns the total wire length (28-byte IKE header +
+// SK payload) that encryptSK will produce for plainLen bytes of plaintext,
+// without actually encrypting. Callers need this to fill in the IKE header's
+// Length field before encryptSK builds the authenticated message (the header
+// itself is part of the AEAD additional authenticated data, so it must be
+// finalized first). Mirrors encryptSK's branch on IsAEAD() exactly — see that
+// function and encryptSKAEAD for the wire format this matches.
+func encryptedSKMessageLen(saKey *ikeSAKey, plainLen int) (int, error) {
+	if saKey.encr.IsAEAD() {
+		gcm, salt, err := aeadCipher(saKey.SK_er, saKey.encr.saltLen)
+		if err != nil {
+			return 0, fmt.Errorf("ikev2 AEAD length: %w", err)
+		}
+		explicitIVLen := gcm.NonceSize() - len(salt)
+		skPayloadLen := 4 + explicitIVLen + plainLen + gcm.Overhead()
+		return message.IKE_HEADER_LEN + skPayloadLen, nil
+	}
+
+	integLen := saKey.integ.OutputLen()
+	blockSize := saKey.encr.BlockSize()
+	padLen := blockSize - (plainLen % blockSize)
+	cipherLen := blockSize + plainLen + padLen
+	skPayloadLen := 4 + cipherLen + integLen
+	return message.IKE_HEADER_LEN + skPayloadLen, nil
+}
+
 // encryptSK encrypts inner payloads into an SK-wrapped IKE message ready to send.
 // ikeMsgHeader is the 28-byte IKE fixed header with Length already set to final.
 // innerNextPayload is the payload type of the first inner payload (written into the

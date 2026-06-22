@@ -51,6 +51,15 @@ type EAPResult struct {
 	EAPPayload []byte
 	MSK        []byte
 	APNProfile *APNProfile
+	// PermanentIdentity is the AAA/HSS-resolved permanent user identity (IMSI,
+	// no leading authentication-method digit) from the DEA's User-Name AVP
+	// (TS 29.273 clause 9.2.2.1.2; "Permanent User Identity" IE). Only
+	// populated on EAP success. When the UE authenticated with its root NAI
+	// directly, this is normally just the IMSI it already presented; when it
+	// authenticated with a pseudonym or fast re-authentication identity (TS
+	// 23.003 §19.3.4/19.3.5 — opaque AAA-assigned values, not derivable from
+	// the NAI itself), this is the only authoritative source for the IMSI.
+	PermanentIdentity string
 }
 
 type APNProfile struct {
@@ -127,8 +136,12 @@ func (c *Client) Stop() error {
 }
 
 func (c *Client) ExchangeEAP(ctx context.Context, req EAPRequest) (*EAPResult, error) {
-	if req.IMSI == "" {
-		return nil, fmt.Errorf("SWm EAP exchange requires IMSI")
+	// IMSI is intentionally not required here: a UE authenticating with an
+	// EAP-AKA pseudonym or fast re-authentication identity (TS 23.003
+	// §19.3.4/19.3.5) has no locally-known IMSI — only the AAA server can
+	// resolve one, returned later in the DEA's Permanent User Identity.
+	if req.NAI == "" {
+		return nil, fmt.Errorf("SWm EAP exchange requires NAI")
 	}
 	if req.APN == "" {
 		return nil, fmt.Errorf("SWm EAP exchange requires APN")
@@ -143,7 +156,7 @@ func (c *Client) ExchangeEAP(ctx context.Context, req EAPRequest) (*EAPResult, e
 	if sessionID == "" {
 		sessionID = fmt.Sprintf("%s;%d", c.cfg.SWM.OriginHost, time.Now().UnixNano())
 	}
-	msg := c.newDER(sessionID, req.IMSI, req.APN, req.EAPPayload)
+	msg := c.newDER(sessionID, req.NAI, req.APN, req.EAPPayload)
 	c.log.Info("SWm DER sent",
 		"session_id", sessionID,
 		"imsi", req.IMSI,
@@ -426,7 +439,12 @@ func (c *Client) newSTR(sessionID string, cause uint32) diameter.Message {
 	return c.newRequest(diameter.CommandSTR, config.SWMApplicationID, true, avps)
 }
 
-func (c *Client) newDER(sessionID, imsi, apn string, eapPayload []byte) diameter.Message {
+// newDER builds the Diameter-EAP-Request. The User-Name AVP carries the NAI
+// exactly as the UE presented it (TS 29.273 clause 9.2.2.1.1) — root NAI,
+// pseudonym, or fast re-authentication identity alike — so the AAA server
+// can route and resolve it; the ePDG must not substitute a locally-parsed
+// IMSI here, since pseudonym/fast-reauth identities aren't IMSIs at all.
+func (c *Client) newDER(sessionID, nai, apn string, eapPayload []byte) diameter.Message {
 	avps := []diameter.AVP{
 		diameter.UTF8AVP(diameter.AVPSessionID, 0, sessionID),
 		diameter.Uint32AVP(diameter.AVPAuthApplicationID, 0, config.SWMApplicationID),
@@ -434,7 +452,7 @@ func (c *Client) newDER(sessionID, imsi, apn string, eapPayload []byte) diameter
 		diameter.UTF8AVP(diameter.AVPOriginRealm, 0, c.cfg.SWM.OriginRealm),
 		diameter.UTF8AVP(diameter.AVPDestinationRealm, 0, c.cfg.SWM.DestinationRealm),
 		diameter.Uint32AVP(diameter.AVPAuthRequestType, 0, 1),
-		diameter.UTF8AVP(diameter.AVPUserName, 0, imsi),
+		diameter.UTF8AVP(diameter.AVPUserName, 0, nai),
 		diameter.UTF8AVP(diameter.AVPServiceSelection, 0, apn),
 		diameter.OctetAVP(diameter.AVPEAPPayload, 0, diameter.FlagMandatory, eapPayload),
 	}
@@ -477,9 +495,20 @@ func (c *Client) eapResult(req EAPRequest, sessionID string, answer diameter.Mes
 		allowed = true
 	}
 	var msk []byte
+	var permanentIdentity string
 	if state == EAPStateSuccess && allowed {
 		if key, ok := diameter.FindAVP(answer.AVPs, diameter.AVPEAPMasterSessionKey, 0); ok && len(key.Data) == 64 {
 			msk = append([]byte(nil), key.Data...)
+		}
+		// TS 29.273 clause 9.2.2.1.2: the DEA's User-Name AVP, when present,
+		// carries the AAA/HSS-resolved "Permanent User Identity" — an IMSI in
+		// root NAI format with no leading authentication-method digit. This
+		// is the only authoritative IMSI source when the UE authenticated
+		// with a pseudonym or fast re-authentication identity.
+		if userName := diameter.AVPString(answer.AVPs, diameter.AVPUserName, 0); userName != "" {
+			if imsi, ok := permanentIMSIFromUserName(userName); ok {
+				permanentIdentity = imsi
+			}
 		}
 	}
 	profile := parseAPNProfile(answer.AVPs, req.APN)
@@ -495,24 +524,47 @@ func (c *Client) eapResult(req EAPRequest, sessionID string, answer diameter.Mes
 		"eap_payload_len", len(responsePayload),
 		"msk_present", len(msk) == 64,
 		"msk_len", len(msk),
+		"permanent_identity_present", permanentIdentity != "",
 		"apn_profile_present", profile != nil,
 		"apn_ambr_present", profile != nil && profile.AMBRPresent,
 		"apn_ambr_ul_bps", apnAMBRUL(profile),
 		"apn_ambr_dl_bps", apnAMBRDL(profile),
 	)
 	return &EAPResult{
-		SessionID:  sessionID,
-		ResultCode: resultCode,
-		State:      state,
-		Allowed:    allowed,
-		IMSI:       req.IMSI,
-		NAI:        req.NAI,
-		APN:        req.APN,
-		Reason:     reason,
-		EAPPayload: responsePayload,
-		MSK:        msk,
-		APNProfile: profile,
+		SessionID:         sessionID,
+		ResultCode:        resultCode,
+		State:             state,
+		Allowed:           allowed,
+		IMSI:              req.IMSI,
+		NAI:               req.NAI,
+		APN:               req.APN,
+		Reason:            reason,
+		EAPPayload:        responsePayload,
+		MSK:               msk,
+		APNProfile:        profile,
+		PermanentIdentity: permanentIdentity,
 	}
+}
+
+// permanentIMSIFromUserName extracts and validates the IMSI from a DEA
+// User-Name AVP carrying a Permanent User Identity (TS 29.273 clause
+// 9.2.2.1.2): root-NAI-formatted, with no leading authentication-method
+// digit — i.e. just "<IMSI>@realm" or, if the AAA server returned a bare
+// username, "<IMSI>". TS 23.003 IMSIs are 6-15 digits.
+func permanentIMSIFromUserName(userName string) (imsi string, ok bool) {
+	local := userName
+	if idx := strings.IndexByte(userName, '@'); idx >= 0 {
+		local = userName[:idx]
+	}
+	if len(local) < 6 || len(local) > 15 {
+		return "", false
+	}
+	for _, c := range local {
+		if c < '0' || c > '9' {
+			return "", false
+		}
+	}
+	return local, true
 }
 
 func parseAPNProfile(avps []diameter.AVP, requested string) *APNProfile {

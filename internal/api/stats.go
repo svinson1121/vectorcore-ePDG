@@ -16,6 +16,7 @@ func (s *Server) registerStats(api huma.API) {
 			ActiveBearers: s.activeBearerCount(sessions),
 		}
 		for _, sess := range sessions {
+			sess.RLock()
 			if sess.State == session.StateActive {
 				resp.ActiveClients++
 			}
@@ -25,6 +26,7 @@ func (s *Server) registerStats(api huma.API) {
 			if sess.ESPInboundSPI != 0 {
 				resp.ActiveChildSAs++
 			}
+			sess.RUnlock()
 		}
 		return &struct{ Body StatsResponse }{resp}, nil
 	})
@@ -43,16 +45,18 @@ func (s *Server) registerStats(api huma.API) {
 		tc := s.gtpu.TCCounters()
 		xdp := s.gtpu.XDPCounters()
 		resp := GTPUStatsResponse{
-			DownlinkRxPackets:  xdp["seen"],
-			DownlinkTxPackets:  xdp["decap_pass"],
-			DroppedBadTEID:     xdp["teid_miss"],
-			DroppedBadPeer:     dpStats.DroppedBadPeer,
-			DroppedUnsupported: dpStats.DroppedUnsupported,
-			DroppedMalformed:   dpStats.DroppedMalformed,
-			UplinkRxPackets:    tc["seen"],
-			UplinkTxPackets:    tc["encap_ok"],
-			ActiveTunnels:      s.gtpu.ActiveSessionCount(),
-			ActiveBearers:      s.activeBearerCount(s.sessions.Snapshot()),
+			DownlinkRxPackets:           xdp["seen"],
+			DownlinkTxPackets:           xdp["decap_pass"],
+			DroppedBadTEID:              xdp["teid_miss"],
+			DroppedBadPeer:              dpStats.DroppedBadPeer,
+			DroppedUnsupported:          dpStats.DroppedUnsupported,
+			DroppedMalformed:            dpStats.DroppedMalformed,
+			ErrorIndicationsSent:        dpStats.ErrorIndicationsSent,
+			ErrorIndicationsRateLimited: dpStats.ErrorIndicationsRateLimited,
+			UplinkRxPackets:             tc["seen"],
+			UplinkTxPackets:             tc["encap_ok"],
+			ActiveTunnels:               s.gtpu.ActiveSessionCount(),
+			ActiveBearers:               s.activeBearerCount(s.sessions.Snapshot()),
 		}
 		return &struct{ Body GTPUStatsResponse }{resp}, nil
 	})
@@ -70,12 +74,14 @@ func (s *Server) registerStats(api huma.API) {
 			ESPBytesOut:   espStats.BytesOut,
 		}
 		for _, sess := range sessions {
+			sess.RLock()
 			if sess.IkeSPII != 0 {
 				resp.ActiveIKESAs++
 			}
 			if sess.ESPInboundSPI != 0 {
 				resp.ActiveChildSAs++
 			}
+			sess.RUnlock()
 		}
 		return &struct{ Body IPsecStatsResponse }{resp}, nil
 	})

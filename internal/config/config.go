@@ -65,6 +65,21 @@ type IKEv2Config struct {
 	DPDDelay int
 	// DPDTimeout is the seconds to wait for a DPD response before tearing down. Default 120.
 	DPDTimeout int
+	// MaxConcurrentPackets bounds how many inbound IKE packets are processed
+	// concurrently (one goroutine each otherwise has no ceiling). Default 2048.
+	MaxConcurrentPackets int
+	// HalfOpenSATimeout is the seconds an unauthenticated IKE SA (IKE_SA_INIT
+	// done, IKE_AUTH not yet completed) may exist before being expired.
+	// Default 30. This runs independently of DPDEnabled — it's a
+	// resource-exhaustion control, not a liveness feature.
+	HalfOpenSATimeout int
+	// MaxHalfOpenSAs caps the number of unauthenticated IKE SAs tracked at
+	// once; new IKE_SA_INIT requests are rejected once at/above this. Default 4096.
+	MaxHalfOpenSAs int
+	// CookieThreshold is the half-open SA count at/above which the RFC 7296
+	// §2.6 COOKIE challenge is required for new IKE_SA_INIT requests.
+	// Default 2048.
+	CookieThreshold int
 }
 
 type EPDGConfig struct {
@@ -102,18 +117,12 @@ type GTPConfig struct {
 	MTU               int
 	ValidateOuterPeer bool
 	StrictPeerCheck   bool
-	DedicatedBearers  DedicatedBearerConfig
 	BPF               BPFConfig
 	// MaxSequence caps the GTPv2-C sequence number range. Default 0 means
 	// use the full 24-bit range (0xFFFFFF) per TS 29.274 §6.1.2.
 	// Set to 8388607 (0x7FFFFF) for Cisco StarOS qvpc-si interop — StarOS
 	// incorrectly rejects sequences with the 23rd bit set.
 	MaxSequence uint32
-}
-
-type DedicatedBearerConfig struct {
-	Enabled            bool
-	TFTUplinkSelection bool
 }
 
 type BPFConfig struct {
@@ -231,6 +240,14 @@ func setValue(cfg *Config, section, key, value string) error {
 			return setInt(value, &cfg.IKEv2.DPDDelay, section, key)
 		case "dpd_timeout":
 			return setInt(value, &cfg.IKEv2.DPDTimeout, section, key)
+		case "max_concurrent_packets":
+			return setInt(value, &cfg.IKEv2.MaxConcurrentPackets, section, key)
+		case "half_open_sa_timeout":
+			return setInt(value, &cfg.IKEv2.HalfOpenSATimeout, section, key)
+		case "max_half_open_sas":
+			return setInt(value, &cfg.IKEv2.MaxHalfOpenSAs, section, key)
+		case "cookie_threshold":
+			return setInt(value, &cfg.IKEv2.CookieThreshold, section, key)
 		}
 	case "logging":
 		switch key {
@@ -282,13 +299,6 @@ func setValue(cfg *Config, section, key, value string) error {
 			return setBool(value, &cfg.GTP.StrictPeerCheck, section, key)
 		case "max_sequence":
 			return setUint32(value, &cfg.GTP.MaxSequence, section, key)
-		}
-	case "dedicated_bearers":
-		switch key {
-		case "enabled":
-			return setBool(value, &cfg.GTP.DedicatedBearers.Enabled, section, key)
-		case "tft_uplink_selection":
-			return setBool(value, &cfg.GTP.DedicatedBearers.TFTUplinkSelection, section, key)
 		}
 	case "apn":
 		switch key {
@@ -355,10 +365,14 @@ func Default() *Config {
 			File:  "/var/log/vectorcore/epdg/epdg.log",
 		},
 		IKEv2: IKEv2Config{
-			ListenAddr: "0.0.0.0",
-			DPDEnabled: true,
-			DPDDelay:   30,
-			DPDTimeout: 120,
+			ListenAddr:           "0.0.0.0",
+			DPDEnabled:           true,
+			DPDDelay:             30,
+			DPDTimeout:           120,
+			MaxConcurrentPackets: 2048,
+			HalfOpenSATimeout:    30,
+			MaxHalfOpenSAs:       4096,
+			CookieThreshold:      2048,
 		},
 		SWM: SWMConfig{
 			Proto:                   "sctp",
@@ -370,10 +384,6 @@ func Default() *Config {
 			MTU:               1400,
 			ValidateOuterPeer: true,
 			StrictPeerCheck:   true,
-			DedicatedBearers: DedicatedBearerConfig{
-				Enabled:            true,
-				TFTUplinkSelection: true,
-			},
 			BPF: BPFConfig{
 				XDPAttachMode: "generic",
 				MapMaxEntries: 4096,

@@ -134,8 +134,10 @@ func (s *Server) handleInformational(conn *net.UDPConn, remote *net.UDPAddr, pkt
 					sa.pendingNonceR = nil
 					if s.sessions != nil && sa.sessionID != "" {
 						if sess := s.sessions.Get(sa.sessionID); sess != nil {
+							sess.Lock()
 							sess.ESPInboundSPI = sa.localESPSPI
 							sess.ESPOutboundSPI = sa.peerESPSPI
+							sess.Unlock()
 						}
 					}
 					s.log.Info("INFORMATIONAL: CHILD SA rekey complete — pending SA promoted",
@@ -203,10 +205,19 @@ func (s *Server) fullTeardown(sa *ikeSA, reason string) {
 	handoverComplete := false
 	if s.sessions != nil && sa.sessionID != "" {
 		if sess := s.sessions.Get(sa.sessionID); sess != nil {
+			sess.Lock()
 			handoverComplete = sess.HandoverComplete
 			_ = sess.Transition(session.StateCleaningUp)
+			hasS2B := sess.S2B != nil
+			var s2bCtx session.S2BContext
+			if hasS2B {
+				s2bCtx = *sess.S2B
+			}
+			sess.Unlock()
 
-			if s.gtpuMgr != nil && sess.S2B != nil {
+			// gtpuMgr.RemoveSession takes sess and locks internally for its own
+			// field accesses — do not hold sess.Lock() across this call.
+			if s.gtpuMgr != nil && hasS2B {
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				if err := s.gtpuMgr.RemoveSession(ctx, sess); err != nil {
 					s.log.Warn("fullTeardown: GTP-U remove failed", "err", err, "session_id", sess.ID)
@@ -214,21 +225,23 @@ func (s *Server) fullTeardown(sa *ikeSA, reason string) {
 				cancel()
 			}
 
-			if s.s2b != nil && sess.S2B != nil && sess.S2B.PGWControlTEID != 0 && sess.S2B.EBI != 0 {
+			if s.s2b != nil && hasS2B && s2bCtx.PGWControlTEID != 0 && s2bCtx.EBI != 0 {
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				if err := s.s2b.DeleteSession(ctx,
-					sess.S2B.PGWControlIP,
-					sess.S2B.PGWControlTEID,
-					sess.S2B.LocalControlTEID,
-					sess.S2B.LocalUserTEID,
-					sess.S2B.EBI,
+					s2bCtx.PGWControlIP,
+					s2bCtx.PGWControlTEID,
+					s2bCtx.LocalControlTEID,
+					s2bCtx.LocalUserTEID,
+					s2bCtx.EBI,
 				); err != nil {
 					s.log.Warn("fullTeardown: S2b DeleteSession failed", "err", err, "session_id", sess.ID)
 				}
 				cancel()
 			}
 
+			sess.Lock()
 			_ = sess.Transition(session.StateDeleted)
+			sess.Unlock()
 			s.sessions.Delete(sess.ID)
 		}
 	}
@@ -261,8 +274,14 @@ func (s *Server) removeXFRMChildSA(sa *ikeSA) {
 	var remoteTS *net.IPNet
 	// Try to reconstruct the remote TS from the session PAA.
 	if s.sessions != nil && sa.sessionID != "" {
-		if sess := s.sessions.Get(sa.sessionID); sess != nil && sess.S2B != nil {
-			if paa := net.ParseIP(sess.S2B.PAA); paa != nil {
+		if sess := s.sessions.Get(sa.sessionID); sess != nil {
+			sess.RLock()
+			var paaStr string
+			if sess.S2B != nil {
+				paaStr = sess.S2B.PAA
+			}
+			sess.RUnlock()
+			if paa := net.ParseIP(paaStr); paa != nil {
 				if paa4 := paa.To4(); paa4 != nil {
 					remoteTS = &net.IPNet{IP: paa4, Mask: net.CIDRMask(32, 32)}
 				}
@@ -397,7 +416,9 @@ func (s *Server) handleUpdateSA(conn *net.UDPConn, remote *net.UDPAddr, sa *ikeS
 	sa.cookie2 = nil
 	if s.sessions != nil && sa.sessionID != "" {
 		if sess := s.sessions.Get(sa.sessionID); sess != nil {
+			sess.Lock()
 			sess.OuterIP = remote.String()
+			sess.Unlock()
 		}
 	}
 	_ = s.sendEncryptedRaw(conn, remote, sa, message.INFORMATIONAL, msgID, 0, nil, natt)
@@ -409,8 +430,14 @@ func (s *Server) handleUpdateSA(conn *net.UDPConn, remote *net.UDPAddr, sa *ikeS
 func (s *Server) migrateMobikeXFRM(sa *ikeSA, newRemote *net.UDPAddr) error {
 	var remoteTS *net.IPNet
 	if s.sessions != nil && sa.sessionID != "" {
-		if sess := s.sessions.Get(sa.sessionID); sess != nil && sess.S2B != nil {
-			if paa := net.ParseIP(sess.S2B.PAA); paa != nil {
+		if sess := s.sessions.Get(sa.sessionID); sess != nil {
+			sess.RLock()
+			var paaStr string
+			if sess.S2B != nil {
+				paaStr = sess.S2B.PAA
+			}
+			sess.RUnlock()
+			if paa := net.ParseIP(paaStr); paa != nil {
 				if paa4 := paa.To4(); paa4 != nil {
 					remoteTS = &net.IPNet{IP: paa4, Mask: net.CIDRMask(32, 32)}
 				}
@@ -533,6 +560,55 @@ func (s *Server) reaperLoop() {
 	}
 }
 
+// halfOpenReaperLoop expires unauthenticated IKE SAs (IKE_SA_INIT completed,
+// IKE_AUTH not yet completed) that have outlived HalfOpenSATimeout. This runs
+// unconditionally, independent of DPDEnabled: DPD is a liveness feature for
+// established SAs, whereas this is a resource-exhaustion control — an
+// operator disabling DPD shouldn't also lose half-open SA expiry.
+func (s *Server) halfOpenReaperLoop() {
+	timeout := s.halfOpenSATimeout()
+	tick := timeout / 3
+	if tick < time.Second {
+		tick = time.Second
+	}
+
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		s.mu.RLock()
+		spis := make([]uint64, 0, len(s.sas))
+		for spiI := range s.sas {
+			spis = append(spis, spiI)
+		}
+		s.mu.RUnlock()
+
+		expired := 0
+		for _, spiI := range spis {
+			sa := s.lookupSA(spiI)
+			if sa == nil {
+				continue
+			}
+			sa.mu.Lock()
+			shouldExpire := sa.state == ikeStateAuth && time.Since(sa.createdAt) > timeout
+			sa.mu.Unlock()
+			if shouldExpire {
+				s.deleteSA(spiI)
+				expired++
+			}
+		}
+		if expired > 0 {
+			s.log.Info("IKEv2: expired half-open IKE SAs", "count", expired, "timeout", timeout)
+		}
+	}
+}
+
 // sendDPDProbe sends an empty INFORMATIONAL request to the UE as a liveness probe.
 // Must be called with sa.mu held. sa.state must be ikeStateEstablished.
 func (s *Server) sendDPDProbe(sa *ikeSA) {
@@ -561,12 +637,10 @@ func (s *Server) sendDPDProbe(sa *ikeSA) {
 // (as IKE responder). Differs from sendEncryptedRaw in that the IKE header flags are
 // 0x00 — no Initiator bit (ePDG is IKE responder), no Response bit (this is a request).
 func (s *Server) sendEncryptedRequest(conn *net.UDPConn, remote *net.UDPAddr, sa *ikeSA, exchType uint8, msgID uint32, innerNextPayload uint8, plain []byte, natt bool) error {
-	integLen := sa.saKey.integ.OutputLen()
-	blockSize := sa.saKey.encr.BlockSize()
-	padLen := blockSize - (len(plain) % blockSize)
-	cipherLen := blockSize + len(plain) + padLen
-	skPayloadLen := 4 + cipherLen + integLen
-	totalLen := message.IKE_HEADER_LEN + skPayloadLen
+	totalLen, err := encryptedSKMessageLen(sa.saKey, len(plain))
+	if err != nil {
+		return fmt.Errorf("compute message length: %w", err)
+	}
 
 	hdrBytes := buildIKERequestHeaderBytes(sa.spiI, sa.spiR, exchType, msgID, totalLen)
 

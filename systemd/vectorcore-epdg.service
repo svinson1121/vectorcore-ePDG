@@ -1,0 +1,14 @@
+[Unit]
+Description=VectorCore ePDG
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/vectorcore
+ExecStart=/opt/vectorcore/bin/epdg -c /opt/vectorcore/etc/epdg.yaml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

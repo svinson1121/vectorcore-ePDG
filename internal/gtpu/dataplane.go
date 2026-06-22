@@ -24,13 +24,28 @@ import (
 )
 
 const (
-	gtpuVersionPT      byte  = 0x30
-	gtpuFlagE          byte  = 0x04
-	gtpuFlagS          byte  = 0x02
-	gtpuFlagPN         byte  = 0x01
-	gtpuMsgEchoRequest uint8 = 1
-	gtpuMsgEchoResp    uint8 = 2
-	gtpuMsgTPDU        uint8 = 255
+	gtpuVersionPT          byte  = 0x30
+	gtpuFlagE              byte  = 0x04
+	gtpuFlagS              byte  = 0x02
+	gtpuFlagPN             byte  = 0x01
+	gtpuMsgEchoRequest     uint8 = 1
+	gtpuMsgEchoResp        uint8 = 2
+	gtpuMsgErrorIndication uint8 = 26
+	gtpuMsgTPDU            uint8 = 255
+
+	// TS 29.281 §8.3/§8.4: Error Indication IE types.
+	ieTypeTEIDDataI    uint8 = 16  // TV, 4-byte TEID value
+	ieTypeGTPUPeerAddr uint8 = 133 // TLV, 4 (IPv4) or 16 (IPv6) byte address
+
+	// errorIndicationMaxPerSecond bounds the rate of Error Indications this
+	// node will generate. Each one is an unsolicited UDP reply to whatever
+	// source address sent the triggering (and possibly spoofed) G-PDU —
+	// without a cap, an attacker rotating fake TEIDs across spoofed sources
+	// could use this node as a reflection/amplification primitive (TS
+	// 29.281 §7.3.1 notes the UDP Port extension header exists specifically
+	// to help mitigate this risk; rate-limiting the response itself is the
+	// other half of that mitigation).
+	errorIndicationMaxPerSecond = 50
 
 	tcTFTFlagRemoteIP   uint8 = 0x01
 	tcTFTFlagProtocol   uint8 = 0x02
@@ -65,8 +80,33 @@ type Manager struct {
 	pathsByPeer map[string]*pathState
 	echoSeq     uint16
 
+	eiLimiter errorIndicationLimiter
+
 	bpf *BPFDataplane
 	tc  *TCDataplane
+}
+
+// errorIndicationLimiter is a fixed-window rate limiter bounding how many
+// GTP-U Error Indications this node sends per second. Zero value is ready
+// to use (first call starts the window).
+type errorIndicationLimiter struct {
+	mu          sync.Mutex
+	windowStart time.Time
+	count       int
+}
+
+func (l *errorIndicationLimiter) allow(now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.windowStart.IsZero() || now.Sub(l.windowStart) >= time.Second {
+		l.windowStart = now
+		l.count = 0
+	}
+	if l.count >= errorIndicationMaxPerSecond {
+		return false
+	}
+	l.count++
+	return true
 }
 
 type Session struct {
@@ -149,12 +189,14 @@ type BearerRef struct {
 }
 
 type DataplaneStats struct {
-	DownlinkGTPUIn     uint64
-	DownlinkPacketsOut uint64
-	DroppedBadTEID     uint64
-	DroppedBadPeer     uint64
-	DroppedUnsupported uint64
-	DroppedMalformed   uint64
+	DownlinkGTPUIn              uint64
+	DownlinkPacketsOut          uint64
+	DroppedBadTEID              uint64
+	DroppedBadPeer              uint64
+	DroppedUnsupported          uint64
+	DroppedMalformed            uint64
+	ErrorIndicationsSent        uint64
+	ErrorIndicationsRateLimited uint64
 }
 
 type rollbackState struct {
@@ -194,6 +236,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		localIP,
 		m.cfg.GTP.BPF.XDPAttachMode,
 		m.cfg.GTP.BPF.MapMaxEntries,
+		m.cfg.GTP.ValidateOuterPeer,
 	)
 	if err != nil {
 		return fmt.Errorf("BPF downlink XDP: %w", err)
@@ -285,14 +328,29 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 		stepInstallDefaultBearer = "install_default_bearer"
 		stepFinalizeDatapath     = "finalize_datapath"
 	)
-	if sess == nil || sess.S2B == nil {
+	if sess == nil {
 		return fmt.Errorf("%s: GTP-U session requires S2b context", stepValidateInput)
 	}
-	paa := net.ParseIP(sess.S2B.PAA)
-	if paa == nil || paa.To4() == nil {
-		return fmt.Errorf("%s: GTP-U session requires IPv4 PAA, got %q", stepValidateInput, sess.S2B.PAA)
+	// Read every sess field this function needs up front, under one RLock,
+	// into local copies — the rest of the function (BPF/TC installs) does
+	// not touch sess again until the final Datapath write, so it never
+	// holds sess's lock across syscalls.
+	sess.RLock()
+	hasS2B := sess.S2B != nil
+	var s2bCtx session.S2BContext
+	if hasS2B {
+		s2bCtx = *sess.S2B
 	}
-	pgw := sess.S2B.PGWUserIP.To4()
+	sessID, imsi, apn := sess.ID, sess.IMSI, sess.APN
+	sess.RUnlock()
+	if !hasS2B {
+		return fmt.Errorf("%s: GTP-U session requires S2b context", stepValidateInput)
+	}
+	paa := net.ParseIP(s2bCtx.PAA)
+	if paa == nil || paa.To4() == nil {
+		return fmt.Errorf("%s: GTP-U session requires IPv4 PAA, got %q", stepValidateInput, s2bCtx.PAA)
+	}
+	pgw := s2bCtx.PGWUserIP.To4()
 	if pgw == nil {
 		return fmt.Errorf("%s: missing PGW GTP-U IP from S2b Create Session Response", stepValidateInput)
 	}
@@ -301,40 +359,40 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 		return fmt.Errorf("%s: invalid local GTP-U IP %q", stepValidateInput, m.cfg.GTP.LocalGTPU)
 	}
 	b := &Bearer{
-		EBI:          sess.S2B.EBI,
-		LocalRXTEID:  sess.S2B.LocalUserTEID,
-		RemoteTXTEID: sess.S2B.PGWUserTEID,
+		EBI:          s2bCtx.EBI,
+		LocalRXTEID:  s2bCtx.LocalUserTEID,
+		RemoteTXTEID: s2bCtx.PGWUserTEID,
 		PGWGTPUIP:    pgw,
 		LocalGTPUIP:  local,
 		State:        BearerActive,
 	}
 	ds := &Session{
-		ID:               sess.ID,
-		IMSI:             sess.IMSI,
-		APN:              sess.APN,
+		ID:               sessID,
+		IMSI:             imsi,
+		APN:              apn,
 		PAA:              paa,
 		LocalGTPUIP:      local,
 		PGWGTPUIP:        pgw,
-		DefaultEBI:       sess.S2B.EBI,
-		PGWControlTEID:   sess.S2B.PGWControlTEID,
-		LocalControlTEID: sess.S2B.LocalControlTEID,
-		Bearers:          map[uint8]*Bearer{sess.S2B.EBI: b},
+		DefaultEBI:       s2bCtx.EBI,
+		PGWControlTEID:   s2bCtx.PGWControlTEID,
+		LocalControlTEID: s2bCtx.LocalControlTEID,
+		Bearers:          map[uint8]*Bearer{s2bCtx.EBI: b},
 	}
 	m.log.Info("GTP-U session add started",
-		"session_id", sess.ID,
-		"imsi", sess.IMSI,
-		"apn", sess.APN,
+		"session_id", sessID,
+		"imsi", imsi,
+		"apn", apn,
 		"paa", paa.String(),
 		"ebi", b.EBI,
 		"local_rx_teid", b.LocalRXTEID,
 		"remote_tx_teid", b.RemoteTXTEID,
 		"pgw_gtpu", pgw.String(),
 	)
-	rb := newRollbackState(m, sess.ID, paa)
+	rb := newRollbackState(m, sessID, paa)
 	committed := false
 	fail := func(step string, err error) error {
 		m.log.Error("GTP-U session add failed",
-			"session_id", sess.ID,
+			"session_id", sessID,
 			"paa", paa.String(),
 			"step", step,
 			"error", err,
@@ -349,7 +407,7 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 		}
 	}()
 	m.log.Info("GTP-U default bearer install started",
-		"session_id", sess.ID,
+		"session_id", sessID,
 		"ebi", b.EBI,
 		"local_rx_teid", b.LocalRXTEID,
 		"remote_tx_teid", b.RemoteTXTEID,
@@ -364,9 +422,9 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 	m.bearersByLocalTEID[b.LocalRXTEID] = &BearerRef{SessionID: ds.ID, BearerEBI: b.EBI}
 	m.bearersByRemoteTEID[b.RemoteTXTEID] = &BearerRef{SessionID: ds.ID, BearerEBI: b.EBI}
 	m.mu.Unlock()
-	rb.add(func() { rb.removeSessionState(sess.ID, paa.String()) })
+	rb.add(func() { rb.removeSessionState(sessID, paa.String()) })
 	if m.bpf != nil {
-		if err := m.bpf.AddTEID(b.LocalRXTEID, paa); err != nil {
+		if err := m.bpf.AddTEID(b.LocalRXTEID, paa, pgw); err != nil {
 			return fail(stepInstallDefaultBearer, fmt.Errorf("BPF teid_map: %w", err))
 		}
 		teid := b.LocalRXTEID
@@ -401,6 +459,7 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 		}
 		rb.add(func() { _ = m.removeBPFRoute(paa) })
 	}
+	sess.Lock()
 	sess.Datapath = &session.DatapathContext{
 		UEInnerIP:              paa.String(),
 		RouteInstalled:         false,
@@ -409,14 +468,16 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 		BridgeVerified:         true,
 		IPsecPAAAligned:        true,
 	}
-	if sess.Datapath == nil {
+	datapathSet := sess.Datapath != nil
+	sess.Unlock()
+	if !datapathSet {
 		return fail(stepFinalizeDatapath, fmt.Errorf("datapath context not set"))
 	}
 	committed = true
 	m.log.Info("GTP-U default bearer installed",
-		"session_id", sess.ID,
-		"imsi", sess.IMSI,
-		"apn", sess.APN,
+		"session_id", sessID,
+		"imsi", imsi,
+		"apn", apn,
 		"paa", paa.String(),
 		"ebi", b.EBI,
 		"local_rx_teid", b.LocalRXTEID,
@@ -424,7 +485,7 @@ func (m *Manager) AddSession(ctx context.Context, sess *session.Session) error {
 		"pgw_gtpu", pgw.String(),
 	)
 	m.log.Info("GTP-U session add complete",
-		"session_id", sess.ID,
+		"session_id", sessID,
 		"paa", paa.String(),
 		"ebi", b.EBI,
 	)
@@ -464,8 +525,12 @@ func (m *Manager) RemoveSession(ctx context.Context, sess *session.Session) erro
 		delete(m.sessionsByID, sess.ID)
 	}
 	m.mu.Unlock()
-	if paa == nil && sess.S2B != nil {
-		paa = net.ParseIP(sess.S2B.PAA)
+	if paa == nil {
+		sess.RLock()
+		if sess.S2B != nil {
+			paa = net.ParseIP(sess.S2B.PAA)
+		}
+		sess.RUnlock()
 	}
 	return nil
 }
@@ -494,7 +559,7 @@ func (m *Manager) AddBearer(_ context.Context, sessionID string, b Bearer) error
 	m.bearersByLocalTEID[b.LocalRXTEID] = &BearerRef{SessionID: sessionID, BearerEBI: b.EBI}
 	m.bearersByRemoteTEID[b.RemoteTXTEID] = &BearerRef{SessionID: sessionID, BearerEBI: b.EBI}
 	if m.bpf != nil {
-		if err := m.bpf.AddTEID(b.LocalRXTEID, ds.PAA); err != nil {
+		if err := m.bpf.AddTEID(b.LocalRXTEID, ds.PAA, b.PGWGTPUIP); err != nil {
 			m.log.Warn("BPF teid_map AddTEID failed for dedicated bearer", "teid", b.LocalRXTEID, "error", err)
 		}
 	}
@@ -539,12 +604,14 @@ func (m *Manager) RemoveBearer(_ context.Context, sessionID string, ebi uint8) e
 
 func (m *Manager) Stats() DataplaneStats {
 	return DataplaneStats{
-		DownlinkGTPUIn:     atomic.LoadUint64(&m.stats.DownlinkGTPUIn),
-		DownlinkPacketsOut: atomic.LoadUint64(&m.stats.DownlinkPacketsOut),
-		DroppedBadTEID:     atomic.LoadUint64(&m.stats.DroppedBadTEID),
-		DroppedBadPeer:     atomic.LoadUint64(&m.stats.DroppedBadPeer),
-		DroppedUnsupported: atomic.LoadUint64(&m.stats.DroppedUnsupported),
-		DroppedMalformed:   atomic.LoadUint64(&m.stats.DroppedMalformed),
+		DownlinkGTPUIn:              atomic.LoadUint64(&m.stats.DownlinkGTPUIn),
+		DownlinkPacketsOut:          atomic.LoadUint64(&m.stats.DownlinkPacketsOut),
+		DroppedBadTEID:              atomic.LoadUint64(&m.stats.DroppedBadTEID),
+		DroppedBadPeer:              atomic.LoadUint64(&m.stats.DroppedBadPeer),
+		DroppedUnsupported:          atomic.LoadUint64(&m.stats.DroppedUnsupported),
+		DroppedMalformed:            atomic.LoadUint64(&m.stats.DroppedMalformed),
+		ErrorIndicationsSent:        atomic.LoadUint64(&m.stats.ErrorIndicationsSent),
+		ErrorIndicationsRateLimited: atomic.LoadUint64(&m.stats.ErrorIndicationsRateLimited),
 	}
 }
 
@@ -661,8 +728,15 @@ func (m *Manager) handleDownlink(pkt []byte, peer *net.UDPAddr) {
 		return
 	}
 	if parsed.MessageType == gtpuMsgTPDU {
+		// TS 29.281 §7.3.1: a G-PDU for a TEID with no context shall be
+		// discarded, and if the TEID is non-zero, an Error Indication
+		// returned to the originating peer. Reaching this control-socket
+		// fallback at all means XDP found no teid_map entry (or isn't
+		// attached) — from this node's perspective there is no context for
+		// this TEID either way.
 		atomic.AddUint64(&m.stats.DroppedUnsupported, 1)
 		m.log.Warn("GTP-U T-PDU reached UDP control socket; XDP downlink datapath should have handled it", "teid", parsed.TEID, "peer", peer.String())
+		m.sendErrorIndication(parsed.TEID, peer)
 		return
 	}
 	atomic.AddUint64(&m.stats.DroppedUnsupported, 1)
@@ -672,16 +746,17 @@ func (m *Manager) handleDownlink(pkt []byte, peer *net.UDPAddr) {
 // xdpStatNames maps BPF dl_stats array index to a human-readable label.
 // Must match enum xdp_stat in xdp_gtpu_decap.c.
 var xdpStatNames = []string{
-	"seen",         // 0: IPv4/UDP reached XDP
-	"cfg_miss",     // 1: dst IP != local GTP-U IP
-	"gtp_port",     // 2: passed UDP/2152 check
-	"gtp_tpdu",     // 3: G-PDU message type confirmed
-	"teid_miss",    // 4: TEID not in map → XDP_PASS
-	"teid_hit",     // 5: TEID found
-	"paa_mismatch", // 6: inner dst != PAA → XDP_DROP
-	"paa_match",    // 7: inner dst == PAA
-	"adjust_fail",  // 8: remove_gtp_header failed
-	"decap_pass",   // 9: XDP_PASS after header strip → kernel routing + XFRM
+	"seen",          // 0: IPv4/UDP reached XDP
+	"cfg_miss",      // 1: dst IP != local GTP-U IP
+	"gtp_port",      // 2: passed UDP/2152 check
+	"gtp_tpdu",      // 3: G-PDU message type confirmed
+	"teid_miss",     // 4: TEID not in map → XDP_PASS
+	"teid_hit",      // 5: TEID found
+	"paa_mismatch",  // 6: inner dst != PAA → XDP_DROP
+	"paa_match",     // 7: inner dst == PAA
+	"adjust_fail",   // 8: remove_gtp_header failed
+	"decap_pass",    // 9: XDP_PASS after header strip → kernel routing + XFRM
+	"peer_mismatch", // 10: outer src IP != stored PGW addr → XDP_DROP
 }
 
 // ulStatNames maps TC ul_stats array index to a human-readable label.
@@ -893,6 +968,51 @@ func (m *Manager) respondEcho(seq uint16, peer *net.UDPAddr) {
 	}
 }
 
+// sendErrorIndication implements TS 29.281 §7.3.1: when this GTP-U entity
+// receives a G-PDU for a TEID with no context, it discards the G-PDU and,
+// if the TEID is non-zero, returns a GTP-U Error Indication to peer (the
+// source of the triggering G-PDU). The mandatory IEs are Tunnel Endpoint
+// Identifier Data I (§8.3, the offending TEID) and GTP-U Peer Address
+// (§8.4, this node's own local GTP-U IP — the destination address of the
+// G-PDU that triggered this, per §7.3.1's definition of that IE's value).
+func (m *Manager) sendErrorIndication(teid uint32, peer *net.UDPAddr) {
+	if teid == 0 {
+		// §7.3.1: only a non-zero TEID gets an Error Indication.
+		return
+	}
+	if !m.eiLimiter.allow(time.Now()) {
+		atomic.AddUint64(&m.stats.ErrorIndicationsRateLimited, 1)
+		m.log.Debug("GTP-U Error Indication rate-limited", "teid", teid, "peer", peer.String())
+		return
+	}
+	localIP := net.ParseIP(m.cfg.GTP.LocalGTPU).To4()
+	if localIP == nil {
+		m.log.Warn("GTP-U Error Indication: invalid local GTP-U IP, cannot build GTP-U Peer Address IE", "local_gtpu", m.cfg.GTP.LocalGTPU)
+		return
+	}
+
+	payload := make([]byte, 0, 5+3+4)
+	payload = append(payload, ieTypeTEIDDataI)
+	payload = binary.BigEndian.AppendUint32(payload, teid)
+	payload = append(payload, ieTypeGTPUPeerAddr, 0, 4)
+	payload = append(payload, localIP...)
+
+	// Sequence Number is present (S flag set, per §4.4.3.4) but explicitly
+	// ignored by the receiver for Error Indication (§4.4.3.4) — any value is
+	// spec-conformant.
+	msg, err := encodePathMessage(gtpuMsgErrorIndication, 0, payload)
+	if err != nil {
+		m.log.Warn("GTP-U Error Indication encode failed", "error", err)
+		return
+	}
+	if _, err := m.udp.WriteToUDP(msg, peer); err != nil {
+		m.log.Warn("GTP-U Error Indication send failed", "teid", teid, "peer", peer.String(), "error", err)
+		return
+	}
+	atomic.AddUint64(&m.stats.ErrorIndicationsSent, 1)
+	m.log.Info("GTP-U Error Indication sent", "teid", teid, "peer", peer.String())
+}
+
 // ParseTFT parses a raw TFT IE payload per 3GPP TS 24.008 §10.5.6.12.
 func ParseTFT(raw []byte) (*TFT, error) {
 	if len(raw) < 1 {
@@ -1012,7 +1132,7 @@ func (m *Manager) syncTCBPFTFTRulesLocked(ds *Session) error {
 	if m.tc == nil || ds == nil {
 		return nil
 	}
-	rules := buildTCBPFTFTRules(ds, m.cfg.GTP.DedicatedBearers.TFTUplinkSelection)
+	rules := buildTCBPFTFTRules(ds)
 	if len(rules) > maxTCBPFTFTRules {
 		m.log.Warn("TC-BPF TFT rules truncated", "session_id", ds.ID, "paa", ds.PAA.String(), "rules", len(rules), "max", maxTCBPFTFTRules)
 		rules = rules[:maxTCBPFTFTRules]
@@ -1020,12 +1140,12 @@ func (m *Manager) syncTCBPFTFTRulesLocked(ds *Session) error {
 	if err := m.tc.SetTFTRules(ds.PAA, rules); err != nil {
 		return fmt.Errorf("TC-BPF TFT sync for session %q: %w", ds.ID, err)
 	}
-	m.log.Info("TC-BPF TFT rules synced", "session_id", ds.ID, "paa", ds.PAA.String(), "rules", len(rules), "tft_uplink_selection", m.cfg.GTP.DedicatedBearers.TFTUplinkSelection)
+	m.log.Info("TC-BPF TFT rules synced", "session_id", ds.ID, "paa", ds.PAA.String(), "rules", len(rules))
 	return nil
 }
 
-func buildTCBPFTFTRules(ds *Session, enabled bool) []TCBPFTFTRule {
-	if !enabled || ds == nil {
+func buildTCBPFTFTRules(ds *Session) []TCBPFTFTRule {
+	if ds == nil {
 		return nil
 	}
 	rules := make([]TCBPFTFTRule, 0)

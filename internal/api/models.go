@@ -109,16 +109,18 @@ type BPFStatsResponse struct {
 
 // GTPUStatsResponse is the /stats/gtpu response shape.
 type GTPUStatsResponse struct {
-	DownlinkRxPackets  uint64 `json:"downlink_rx_packets"`
-	DownlinkTxPackets  uint64 `json:"downlink_tx_packets"`
-	DroppedBadTEID     uint64 `json:"dropped_bad_teid"`
-	DroppedBadPeer     uint64 `json:"dropped_bad_peer"`
-	DroppedUnsupported uint64 `json:"dropped_unsupported"`
-	DroppedMalformed   uint64 `json:"dropped_malformed"`
-	UplinkRxPackets    uint64 `json:"uplink_rx_packets"`
-	UplinkTxPackets    uint64 `json:"uplink_tx_packets"`
-	ActiveTunnels      int    `json:"active_tunnels"`
-	ActiveBearers      int    `json:"active_bearers"`
+	DownlinkRxPackets           uint64 `json:"downlink_rx_packets"`
+	DownlinkTxPackets           uint64 `json:"downlink_tx_packets"`
+	DroppedBadTEID              uint64 `json:"dropped_bad_teid"`
+	DroppedBadPeer              uint64 `json:"dropped_bad_peer"`
+	DroppedUnsupported          uint64 `json:"dropped_unsupported"`
+	DroppedMalformed            uint64 `json:"dropped_malformed"`
+	ErrorIndicationsSent        uint64 `json:"error_indications_sent"`
+	ErrorIndicationsRateLimited uint64 `json:"error_indications_rate_limited"`
+	UplinkRxPackets             uint64 `json:"uplink_rx_packets"`
+	UplinkTxPackets             uint64 `json:"uplink_tx_packets"`
+	ActiveTunnels               int    `json:"active_tunnels"`
+	ActiveBearers               int    `json:"active_bearers"`
 }
 
 // IPsecStatsResponse is the /stats/ipsec response shape.

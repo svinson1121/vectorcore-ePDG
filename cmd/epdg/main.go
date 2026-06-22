@@ -107,7 +107,7 @@ func main() {
 
 	s2bClient := s2b.NewClient(*cfg, log.Logger)
 	s2bClient.SetCreateBearerHandler(func(ctx context.Context, event s2b.CreateBearerEvent) s2b.CreateBearerResult {
-		return handlePGWCreateBearer(ctx, manager, gtpuManager, log.Logger, event, cfg.GTP.LocalGTPU, cfg.GTP.DedicatedBearers.TFTUplinkSelection)
+		return handlePGWCreateBearer(ctx, manager, gtpuManager, log.Logger, event, cfg.GTP.LocalGTPU)
 	})
 	s2bClient.SetUpdateBearerHandler(func(ctx context.Context, event s2b.UpdateBearerEvent) s2b.UpdateBearerResult {
 		return handlePGWUpdateBearer(ctx, manager, gtpuManager, log.Logger, event)
@@ -214,15 +214,20 @@ func handlePGWDelete(ctx context.Context, manager *session.Manager, gtpuManager 
 		log.Info("PGW Delete Session matched no active session", "local_control_teid", event.LocalControlTEID)
 		return
 	}
-	log.Info("PGW Delete Session", "session_id", sess.ID, "imsi", sess.IMSI, "is_handover", event.IsHandover)
+	sess.RLock()
+	imsi := sess.IMSI
+	swmSessionID := sess.SWMSessionID
+	sess.RUnlock()
+
+	log.Info("PGW Delete Session", "session_id", sess.ID, "imsi", imsi, "is_handover", event.IsHandover)
 	cleanupSession(sess, gtpuManager, s2bClient, log, "pgw_deleted", false)
-	if swmClient != nil && sess.SWMSessionID != "" {
+	if swmClient != nil && swmSessionID != "" {
 		strCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		var err error
 		if event.IsHandover {
-			err = swmClient.TerminateSessionHandover(strCtx, sess.SWMSessionID)
+			err = swmClient.TerminateSessionHandover(strCtx, swmSessionID)
 		} else {
-			err = swmClient.TerminateSession(strCtx, sess.SWMSessionID)
+			err = swmClient.TerminateSession(strCtx, swmSessionID)
 		}
 		cancel()
 		if err != nil {
@@ -232,7 +237,7 @@ func handlePGWDelete(ctx context.Context, manager *session.Manager, gtpuManager 
 	manager.Delete(sess.ID)
 }
 
-func handlePGWCreateBearer(ctx context.Context, manager *session.Manager, gtpuManager *gtpu.Manager, log *slog.Logger, event s2b.CreateBearerEvent, localGTPU string, tftUplinkSelection bool) s2b.CreateBearerResult {
+func handlePGWCreateBearer(ctx context.Context, manager *session.Manager, gtpuManager *gtpu.Manager, log *slog.Logger, event s2b.CreateBearerEvent, localGTPU string) s2b.CreateBearerResult {
 	var sess *session.Session
 	for attempt := 0; attempt < 10; attempt++ {
 		sess = manager.FindByLocalControlTEID(event.LocalControlTEID)
@@ -249,10 +254,14 @@ func handlePGWCreateBearer(ctx context.Context, manager *session.Manager, gtpuMa
 		log.Warn("PGW Create Bearer matched no active session", "local_control_teid", event.LocalControlTEID)
 		return s2b.CreateBearerResult{Accepted: false, Cause: 64}
 	}
+	sess.RLock()
 	defaultEBI := uint8(0)
+	pgwControlTEID := uint32(0)
 	if sess.S2B != nil {
 		defaultEBI = sess.S2B.EBI
+		pgwControlTEID = sess.S2B.PGWControlTEID
 	}
+	sess.RUnlock()
 	// Wait for the GTP-U session (default bearer) to be installed.
 	// The PGW often sends Create Bearer Request before we've finished installing
 	// the default bearer in the GTP-U manager (~8ms gap). Without this wait,
@@ -344,8 +353,8 @@ func handlePGWCreateBearer(ctx context.Context, manager *session.Manager, gtpuMa
 			HasChargingID: bearer.HasChargingID,
 		})
 	}
-	if sess.S2B != nil && sess.S2B.PGWControlTEID != 0 {
-		result.PGWControlTEID = sess.S2B.PGWControlTEID
+	if pgwControlTEID != 0 {
+		result.PGWControlTEID = pgwControlTEID
 	}
 	return result
 }
@@ -356,25 +365,38 @@ func handlePGWDeleteBearer(ctx context.Context, manager *session.Manager, gtpuMa
 		log.Warn("PGW Delete Bearer matched no session", "local_control_teid", event.LocalControlTEID)
 		return s2b.DeleteBearerResult{Cause: 64}
 	}
+	sess.RLock()
 	pgwControlTEID := uint32(0)
 	defaultEBI := uint8(0)
 	if sess.S2B != nil {
 		pgwControlTEID = sess.S2B.PGWControlTEID
 		defaultEBI = sess.S2B.EBI
 	}
+	imsi := sess.IMSI
+	sess.RUnlock()
+
 	// PGW may send Cause=Reactivation Requested (handover) on a dedicated bearer
 	// DeleteBearerReq before sending a separate one for the default bearer.
 	// Capture the signal here so we act correctly when the default bearer arrives.
-	if event.IsHandover && !sess.HandoverComplete {
-		log.Info("PGW Delete Bearer: handover signal on dedicated bearer", "session_id", sess.ID, "imsi", sess.IMSI, "ebis", event.EBIs)
-		sess.HandoverComplete = true
+	if event.IsHandover {
+		sess.Lock()
+		if !sess.HandoverComplete {
+			sess.HandoverComplete = true
+			log.Info("PGW Delete Bearer: handover signal on dedicated bearer", "session_id", sess.ID, "imsi", imsi, "ebis", event.EBIs)
+		}
+		sess.Unlock()
 	}
 	for _, ebi := range event.EBIs {
 		if defaultEBI != 0 && ebi == defaultEBI {
-			log.Info("PGW Delete Bearer default bearer", "session_id", sess.ID, "imsi", sess.IMSI, "is_handover", sess.HandoverComplete)
-			if sess.HandoverComplete {
+			sess.RLock()
+			handoverComplete := sess.HandoverComplete
+			sess.RUnlock()
+			log.Info("PGW Delete Bearer default bearer", "session_id", sess.ID, "imsi", imsi, "is_handover", handoverComplete)
+			if handoverComplete {
 				cleanupSession(sess, gtpuManager, s2bClient, log, "pgw_delete_default_bearer", false)
+				sess.Lock()
 				sess.S2B = nil // prevent fullTeardown from retrying GTP-U and S2b cleanup
+				sess.Unlock()
 				// Session left in manager — fullTeardown sends USER_MOVED STR when UE sends IKE DELETE or DPD fires
 			} else {
 				cleanupSession(sess, gtpuManager, s2bClient, log, "pgw_delete_default_bearer", false)
@@ -396,10 +418,12 @@ func handlePGWUpdateBearer(ctx context.Context, manager *session.Manager, gtpuMa
 		log.Warn("PGW Update Bearer matched no session", "local_control_teid", event.LocalControlTEID)
 		return s2b.UpdateBearerResult{Cause: 64}
 	}
+	sess.RLock()
 	pgwControlTEID := uint32(0)
 	if sess.S2B != nil {
 		pgwControlTEID = sess.S2B.PGWControlTEID
 	}
+	sess.RUnlock()
 	for _, bc := range event.Bearers {
 		if !bc.HasBearerQoS && !bc.HasTFT {
 			continue
@@ -417,25 +441,41 @@ func handlePGWUpdateBearer(ctx context.Context, manager *session.Manager, gtpuMa
 // ────────────────────────────────────────────────────────────────────────────
 
 func cleanupSession(sess *session.Session, gtpuManager *gtpu.Manager, s2bClient *s2b.Client, log *slog.Logger, reason string, sendS2BDelete bool) {
-	if sess == nil || sess.State == session.StateDeleted {
+	if sess == nil {
+		return
+	}
+	sess.Lock()
+	if sess.State == session.StateDeleted {
+		sess.Unlock()
 		return
 	}
 	_ = sess.Transition(session.StateCleaningUp)
-	if sess.S2B != nil {
+	hasS2B := sess.S2B != nil
+	var s2bCtx session.S2BContext
+	if hasS2B {
+		s2bCtx = *sess.S2B
+	}
+	sess.Unlock()
+
+	// gtpuManager.RemoveSession takes sess and locks internally for its own
+	// field accesses — do not hold sess.Lock() across this call.
+	if hasS2B {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		if err := gtpuManager.RemoveSession(ctx, sess); err != nil {
 			log.Warn("GTP-U session remove failed", "session_id", sess.ID, "error", err)
 		}
 		cancel()
 	}
-	if sendS2BDelete && sess.S2B != nil && sess.S2B.PGWControlTEID != 0 && sess.S2B.EBI != 0 {
+	if sendS2BDelete && hasS2B && s2bCtx.PGWControlTEID != 0 && s2bCtx.EBI != 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		if err := s2bClient.DeleteSession(ctx, sess.S2B.PGWControlIP, sess.S2B.PGWControlTEID, sess.S2B.LocalControlTEID, sess.S2B.LocalUserTEID, sess.S2B.EBI); err != nil {
+		if err := s2bClient.DeleteSession(ctx, s2bCtx.PGWControlIP, s2bCtx.PGWControlTEID, s2bCtx.LocalControlTEID, s2bCtx.LocalUserTEID, s2bCtx.EBI); err != nil {
 			log.Warn("S2b Delete Session failed", "session_id", sess.ID, "error", err)
 		}
 		cancel()
 	}
+	sess.Lock()
 	_ = sess.Transition(session.StateDeleted)
+	sess.Unlock()
 	log.Info("session cleaned up", "session_id", sess.ID, "reason", reason)
 }
 

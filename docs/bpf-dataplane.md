@@ -25,8 +25,6 @@ The BPF dataplane is required.
 bpf:
   xdp_attach_mode: generic
   xdp_interface: ens18
-  xfrm_if_name: vc-xfrm0
-  xfrm_if_id: 1
   map_max_entries: 4096
 ```
 
@@ -34,9 +32,11 @@ bpf:
 |-----|-------------|
 | `xdp_attach_mode` | `generic`, `native`, or `offload` |
 | `xdp_interface` | PGW-facing NIC that receives GTP-U and is used for uplink redirect |
-| `xfrm_if_name` | XFRM virtual interface name; default `vc-xfrm0` |
-| `xfrm_if_id` | XFRM interface ID stamped on IPsec SAs; default `1` |
 | `map_max_entries` | Maximum BPF map entries for sessions and bearers |
+
+The XFRM virtual interface name (`vc-xfrm0`) and its `if_id` (`1`) are fixed
+constants (`internal/xfrm/xfrm.go`), not configurable — they're not exposed
+under `bpf:` in `config/epdg.yaml`.
 
 ## BPF Programs
 

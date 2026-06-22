@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"time"
 )
 
 const (
@@ -15,12 +16,49 @@ const (
 	Version   byte = 1
 	HeaderLen      = 20
 
+	// MaxMessageLen caps the declared Diameter message length DecodeMessage
+	// will allocate a buffer for. 1 MiB is far larger than any SWm message
+	// this implementation sends or expects — EAP payloads are at most a few
+	// KB — while comfortably covering CER/CEA/DWR/DWA/STR/STA and the
+	// largest DER/DEA (EAP challenge plus APN profile AVPs). A peer
+	// declaring a length above this is rejected before any allocation.
+	MaxMessageLen = 1 << 20 // 1 MiB
+
+	// bodyReadTimeout bounds how long DecodeMessage waits to finish reading
+	// a message once its 4-byte length prefix has already arrived. It does
+	// not apply to the (unbounded, by design) wait for the next message's
+	// prefix to begin — connection liveness during genuine idle periods is
+	// the Diameter-level Device-Watchdog-Request/Answer exchange's job, not
+	// a transport-level idle timeout. A peer that starts a message and then
+	// never finishes it is misbehaving regardless of how idle the
+	// connection otherwise is, and ten seconds is far longer than a
+	// well-behaved peer needs to finish sending bytes it already started.
 	CommandCER uint32 = 257
 	CommandDER uint32 = 268
 	CommandDWR uint32 = 280
 	CommandDPR uint32 = 282
 	CommandSTR uint32 = 275
 )
+
+// deadlineSetter is implemented by net.Conn. DecodeMessage uses it, when
+// available, to bound the body-read step described above.
+type deadlineSetter interface {
+	SetReadDeadline(t time.Time) error
+}
+
+// bodyReadTimeout bounds how long DecodeMessage waits to finish reading a
+// message once its 4-byte length prefix has already arrived. It does not
+// apply to the (unbounded, by design) wait for the next message's prefix to
+// begin — connection liveness during genuine idle periods is the
+// Diameter-level Device-Watchdog-Request/Answer exchange's job, not a
+// transport-level idle timeout. A peer that starts a message and then never
+// finishes it is misbehaving regardless of how idle the connection
+// otherwise is, and ten seconds is far longer than a well-behaved peer
+// needs to finish sending bytes it already started.
+//
+// Declared as a var (not const) so tests can shrink it instead of waiting
+// out the real timeout.
+var bodyReadTimeout = 10 * time.Second
 
 const (
 	AVPUserName                    uint32 = 1
@@ -110,6 +148,13 @@ func DecodeMessage(r io.Reader) (Message, error) {
 	if length < HeaderLen {
 		return Message{}, fmt.Errorf("Diameter message length %d too short", length)
 	}
+	if length > MaxMessageLen {
+		return Message{}, fmt.Errorf("Diameter message length %d exceeds maximum %d", length, MaxMessageLen)
+	}
+	if ds, ok := r.(deadlineSetter); ok {
+		_ = ds.SetReadDeadline(time.Now().Add(bodyReadTimeout))
+		defer func() { _ = ds.SetReadDeadline(time.Time{}) }()
+	}
 	rest := make([]byte, length-4)
 	if _, err := io.ReadFull(r, rest); err != nil {
 		return Message{}, err
@@ -169,6 +214,17 @@ func DecodeAVPs(data []byte) ([]AVP, error) {
 				return nil, fmt.Errorf("vendor AVP header truncated")
 			}
 			vendorID = binary.BigEndian.Uint32(data[8:12])
+			if vendorID == 0 {
+				// Vendor-ID 0 means "no vendor" — having the Vendor bit set
+				// alongside it is an invalid/reserved combination, not a
+				// legitimate vendor-specific AVP. Accepting it here would
+				// create an AVP that can't be re-encoded consistently:
+				// AVP.Encode keys the vendor field's presence off
+				// VendorID != 0, so this exact value would silently lose
+				// its (already-meaningless) vendor field on re-encode while
+				// keeping the Vendor bit set, producing malformed output.
+				return nil, fmt.Errorf("AVP code %d: Vendor bit set with Vendor-ID 0", code)
+			}
 		}
 		if length < headerSize || len(data) < length {
 			return nil, fmt.Errorf("AVP length invalid")

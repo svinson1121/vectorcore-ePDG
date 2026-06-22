@@ -41,6 +41,8 @@ func (s *Server) registerClients(api huma.API) {
 }
 
 func clientSummary(sess *session.Session) ClientSummary {
+	sess.RLock()
+	defer sess.RUnlock()
 	ueIP := ""
 	if sess.S2B != nil {
 		ueIP = sess.S2B.PAA
@@ -55,6 +57,7 @@ func clientSummary(sess *session.Session) ClientSummary {
 }
 
 func (s *Server) clientDiag(sess *session.Session) ClientDiag {
+	sess.RLock()
 	out := ClientDiag{
 		IMSI:         sess.IMSI,
 		OuterIP:      sess.OuterIP,
@@ -73,6 +76,7 @@ func (s *Server) clientDiag(sess *session.Session) ClientDiag {
 		}
 		out.PGWControlTEID = sess.S2B.PGWControlTEID
 	}
+	sess.RUnlock()
 
 	gtpuSess, ok := s.gtpu.SessionSnapshot(sess.ID)
 	if !ok {

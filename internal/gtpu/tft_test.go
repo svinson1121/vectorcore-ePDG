@@ -355,7 +355,7 @@ func TestBuildTCBPFTFTRules_RemotePAASelectorRemainsDestinationMatch(t *testing.
 		},
 	}
 
-	rules := buildTCBPFTFTRules(ds, true)
+	rules := buildTCBPFTFTRules(ds)
 	if len(rules) != 1 {
 		t.Fatalf("rules = %d, want 1", len(rules))
 	}

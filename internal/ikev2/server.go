@@ -5,12 +5,16 @@ package ikev2
 
 import (
 	"context"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/pem"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"vectorcore-epdg/internal/config"
 	"vectorcore-epdg/internal/gtpu"
@@ -28,6 +32,13 @@ const (
 
 	// Non-ESP marker prepended to IKE packets on port 4500 (RFC 3948 §2.2).
 	nonESPMarker uint32 = 0x00000000
+
+	// Defaults used when fullCfg is nil (tests) or a value is unset (<=0).
+	// See config.IKEv2Config for the matching production config fields.
+	defaultMaxConcurrentPackets = 2048
+	defaultHalfOpenSATimeout    = 30 * time.Second
+	defaultMaxHalfOpenSAs       = 4096
+	defaultCookieThreshold      = 2048
 )
 
 // Server is the IKEv2 responder.
@@ -53,6 +64,16 @@ type Server struct {
 	// DER-encoded ePDG X.509 certificate (nil → no CERT payload sent).
 	certDER []byte
 
+	// RSA private key matching certDER's public key, used to sign the
+	// responder AUTH payload in the first IKE_AUTH response (TS 33.402 §8.2.1/8.2.2).
+	privateKey *rsa.PrivateKey
+
+	// workers bounds concurrent packet-processing goroutines (one per inbound
+	// IKE packet otherwise has no ceiling). Sized in ListenAndServe.
+	workers chan struct{}
+	// cookies issues/verifies RFC 7296 §2.6 COOKIE challenges under load.
+	cookies *cookieState
+
 	ctx context.Context // cancelled on Close; drives reaperLoop lifetime
 
 	log *slog.Logger
@@ -68,23 +89,131 @@ type Config struct {
 
 func NewServer(cfg *Config, log *slog.Logger) *Server {
 	return &Server{
-		cfg: cfg,
-		sas: make(map[uint64]*ikeSA),
-		log: log,
+		cfg:     cfg,
+		sas:     make(map[uint64]*ikeSA),
+		cookies: newCookieState(),
+		log:     log,
 	}
 }
 
+// saCount returns the total number of tracked IKE SAs (half-open and
+// established), used as the load signal for the COOKIE and half-open-cap
+// gates. Using the total rather than filtering by state avoids touching
+// each ikeSA's own lock just to estimate load.
+func (s *Server) saCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.sas)
+}
+
+func (s *Server) maxConcurrentPackets() int {
+	if s.fullCfg != nil && s.fullCfg.IKEv2.MaxConcurrentPackets > 0 {
+		return s.fullCfg.IKEv2.MaxConcurrentPackets
+	}
+	return defaultMaxConcurrentPackets
+}
+
+func (s *Server) halfOpenSATimeout() time.Duration {
+	if s.fullCfg != nil && s.fullCfg.IKEv2.HalfOpenSATimeout > 0 {
+		return time.Duration(s.fullCfg.IKEv2.HalfOpenSATimeout) * time.Second
+	}
+	return defaultHalfOpenSATimeout
+}
+
+func (s *Server) maxHalfOpenSAs() int {
+	if s.fullCfg != nil && s.fullCfg.IKEv2.MaxHalfOpenSAs > 0 {
+		return s.fullCfg.IKEv2.MaxHalfOpenSAs
+	}
+	return defaultMaxHalfOpenSAs
+}
+
+func (s *Server) cookieThreshold() int {
+	if s.fullCfg != nil && s.fullCfg.IKEv2.CookieThreshold > 0 {
+		return s.fullCfg.IKEv2.CookieThreshold
+	}
+	return defaultCookieThreshold
+}
+
+// SetFullConfig loads and validates the ePDG certificate and private key.
+// TS 33.402 §8.2.1 requires public-key signature authentication of the ePDG:
+// the certificate's dNSName SAN must match the ePDG's IKEv2 ID_FQDN identity,
+// and the private key must be available to sign the responder AUTH payload
+// (§8.2.4.3 additionally requires the digitalSignature key usage bit).
 func (s *Server) SetFullConfig(cfg *config.Config) error {
 	s.fullCfg = cfg
 	if cfg.IKEv2.CertFile == "" {
 		return fmt.Errorf("IKEv2: cert_file is required but not configured")
 	}
-	der, err := loadDERCert(cfg.IKEv2.CertFile)
-	if err != nil {
-		return fmt.Errorf("IKEv2: failed to load cert %q: %w", cfg.IKEv2.CertFile, err)
+	if cfg.IKEv2.KeyFile == "" {
+		return fmt.Errorf("IKEv2: key_file is required but not configured")
 	}
+
+	certPEM, err := os.ReadFile(cfg.IKEv2.CertFile)
+	if err != nil {
+		return fmt.Errorf("IKEv2: failed to read cert %q: %w", cfg.IKEv2.CertFile, err)
+	}
+	der, err := pemToDER(certPEM)
+	if err != nil {
+		return fmt.Errorf("IKEv2: failed to decode cert %q: %w", cfg.IKEv2.CertFile, err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return fmt.Errorf("IKEv2: failed to parse cert %q: %w", cfg.IKEv2.CertFile, err)
+	}
+
+	keyPEM, err := os.ReadFile(cfg.IKEv2.KeyFile)
+	if err != nil {
+		return fmt.Errorf("IKEv2: failed to read key %q: %w", cfg.IKEv2.KeyFile, err)
+	}
+	keyBlock, _ := pem.Decode(keyPEM)
+	if keyBlock == nil {
+		return fmt.Errorf("IKEv2: no PEM block found in key %q", cfg.IKEv2.KeyFile)
+	}
+	var rsaKey *rsa.PrivateKey
+	switch keyBlock.Type {
+	case "RSA PRIVATE KEY":
+		rsaKey, err = x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
+		if err != nil {
+			return fmt.Errorf("IKEv2: failed to parse key %q: %w", cfg.IKEv2.KeyFile, err)
+		}
+	case "PRIVATE KEY":
+		parsed, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+		if err != nil {
+			return fmt.Errorf("IKEv2: failed to parse key %q: %w", cfg.IKEv2.KeyFile, err)
+		}
+		var ok bool
+		rsaKey, ok = parsed.(*rsa.PrivateKey)
+		if !ok {
+			return fmt.Errorf("IKEv2: key %q is not an RSA key (got %T)", cfg.IKEv2.KeyFile, parsed)
+		}
+	default:
+		return fmt.Errorf("IKEv2: unsupported key PEM block type %q in %q", keyBlock.Type, cfg.IKEv2.KeyFile)
+	}
+
+	certPub, ok := cert.PublicKey.(*rsa.PublicKey)
+	if !ok || certPub.N.Cmp(rsaKey.N) != 0 {
+		return fmt.Errorf("IKEv2: private key %q does not match certificate %q", cfg.IKEv2.KeyFile, cfg.IKEv2.CertFile)
+	}
+
+	if cfg.EPDG.Name == "" {
+		return fmt.Errorf("IKEv2: epdg.name must be configured to validate the certificate SAN")
+	}
+	if err := cert.VerifyHostname(cfg.EPDG.Name); err != nil {
+		return fmt.Errorf("IKEv2: certificate %q SAN does not match epdg.name %q: %w", cfg.IKEv2.CertFile, cfg.EPDG.Name, err)
+	}
+	if cert.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		return fmt.Errorf("IKEv2: certificate %q is missing the digitalSignature key usage required by TS 33.402 §8.2.4.3", cfg.IKEv2.CertFile)
+	}
+	now := time.Now()
+	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+		return fmt.Errorf("IKEv2: certificate %q is not currently valid (notBefore=%s notAfter=%s)", cfg.IKEv2.CertFile, cert.NotBefore, cert.NotAfter)
+	}
+
 	s.certDER = der
-	s.log.Info("IKEv2: loaded ePDG certificate", "file", cfg.IKEv2.CertFile, "bytes", len(der))
+	s.privateKey = rsaKey
+	s.log.Info("IKEv2: loaded ePDG certificate and private key",
+		"cert", cfg.IKEv2.CertFile, "key", cfg.IKEv2.KeyFile,
+		"subject", cert.Subject.CommonName, "not_after", cert.NotAfter)
 	return nil
 }
 
@@ -93,17 +222,9 @@ func (s *Server) SetSessionManager(m *session.Manager) { s.sessions = m }
 func (s *Server) SetS2B(c *s2b.Client)                 { s.s2b = c }
 func (s *Server) SetGTPU(m *gtpu.Manager)              { s.gtpuMgr = m }
 
-// loadDERCert reads a PEM file and returns the first certificate's DER bytes.
-func loadDERCert(path string) ([]byte, error) {
-	pemBytes, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return pemToDER(pemBytes)
-}
-
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	s.ctx = ctx
+	s.workers = make(chan struct{}, s.maxConcurrentPackets())
 	ikeP := s.cfg.IKEPort
 	if ikeP == 0 {
 		ikeP = ikePort
@@ -168,6 +289,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}
 
 	go s.reaperLoop()
+	go s.halfOpenReaperLoop()
 	return nil
 }
 
@@ -195,7 +317,18 @@ func (s *Server) readLoop(conn *net.UDPConn, natt bool) {
 		}
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
-		go s.handlePacket(conn, remote, pkt, natt)
+		// Bound concurrent packet processing: an unbounded goroutine-per-packet
+		// dispatch lets unauthenticated UDP traffic exhaust goroutines/memory.
+		// When saturated, drop rather than block the read loop.
+		select {
+		case s.workers <- struct{}{}:
+			go func() {
+				defer func() { <-s.workers }()
+				s.handlePacket(conn, remote, pkt, natt)
+			}()
+		default:
+			s.log.Warn("IKEv2 packet dropped: worker pool saturated", "remote", remote)
+		}
 	}
 }
 
