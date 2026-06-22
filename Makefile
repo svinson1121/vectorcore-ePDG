@@ -4,7 +4,7 @@ CMD=./cmd/epdg
 GOCACHE?=/tmp/vectorcore-epdg-gocache
 GOMODCACHE?=/tmp/vectorcore-epdg-gomodcache
 GOENV=GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE)
-VERSION?=0.3.5d
+VERSION?=0.5.0d
 BUILD_DATE?=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS=-X main.version=$(VERSION) -X main.buildDate=$(BUILD_DATE)
 
